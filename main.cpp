@@ -165,8 +165,9 @@ void OctNode<T>::add_point(Vec3f point, T data0) {
     OctNode *node = this->get_node(loc);
     node->add_point(loc, data1);
     this->occupied = false;
+    this->internal = true;
   }
-
+  
   OctNode *node = this->get_node(point);
   node->add_point(point, data0);
 
@@ -179,21 +180,18 @@ void OctNode<T>::add_point(Vec3f point, T data0) {
 template <typename T>
 class OctTree {
   public: 
-    Vec3f origin;
     std::set<OctNode<T>*> internal; 
     std::set<OctNode<T>*> leafs;
     OctNode<T> *children[8];
     OctTree();
-    OctTree(Vec3f origin);
     ~OctTree();
     void add_point(float x, float y, float z, T data);
 };
 
 
 template <typename T> 
-OctTree<T>::OctTree(): origin(0,0,0) {
-  memset(this->children, 0, 8 * sizeof(OctNode<T> *));
-  
+OctTree<T>::OctTree() {
+  memset(this->children, 0, 8 * sizeof(OctNode<T> *)); 
 }
 
 
