@@ -3,6 +3,9 @@
 #include <map>
 #include <vector>
 #include <tuple>
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <sys/mman.h>
 /* #include <mpi.h>
 #include <omp.h> */
@@ -134,9 +137,9 @@ OctNode<T> * OctNode<T>::get_node(Vec3f point) {
       }
     }
   }
-  origin.x = point.x > 0 ? (this->origin.x + this->bounds.x/2) : (this->origin.x - this->bounds.x/2);
-  origin.y = point.y > 0 ? (this->origin.y + this->bounds.y/2) : (this->origin.y - this->bounds.y/2);
-  origin.z = point.z > 0 ? (this->origin.z + this->bounds.z/2) : (this->origin.z - this->bounds.z/2);
+  origin.x = point.x > this->origin.x ? (this->origin.x + this->bounds.x/2) : (this->origin.x - this->bounds.x/2);
+  origin.y = point.y > this->origin.y ? (this->origin.y + this->bounds.y/2) : (this->origin.y - this->bounds.y/2);
+  origin.z = point.z > this->origin.z ? (this->origin.z + this->bounds.z/2) : (this->origin.z - this->bounds.z/2);
   
   if(this->children[index] == nullptr) {
     this->children[index] = new OctNode(origin, bounds, this->depth + 1);
@@ -152,7 +155,12 @@ void OctNode<T>::add_point(Vec3f point, T data) {
     return;
   } 
   if(!this->internal && this->occupied) {
-    // convert to internal node  
+    // convert to internal node
+    auto e = this->data[0];
+    auto loc = e.first;
+    auto data = e.second;
+    this->data.pop_back();
+    
   }
 
 }
@@ -176,9 +184,9 @@ class OctTree {
 
 
 template <typename T> 
-OctTree<T>::OctTree() {
-  memset(this->children, 0, 8);
-  this->origin.zero();
+OctTree<T>::OctTree(): origin(0,0,0) {
+  memset(this->children, 0, 8 * sizeof(OctNode<T> *));
+  
 }
 
 
@@ -245,5 +253,8 @@ void OctTree<T>::add_point(float x, float y, float z, T data) {
 
 
 int main(int argc, char *argv[]) {
-    return 0;
+  OctTree<int> *tree = new OctTree<int>();
+
+  delete tree;
+  return 0;
 }
