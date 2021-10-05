@@ -80,7 +80,7 @@ class OctNode {
     Vec3f origin;
     Vec3f bounds;
     std::vector<std::pair<Vec3f, T>> data; 
-    OctNode *children[8];
+    OctNode<T> *children[8];
     OctNode(Vec3f, Vec3f, int);
     void add_point(Vec3f point, T data);
     OctNode *get_node(Vec3f point);
@@ -95,6 +95,7 @@ OctNode<T>::OctNode(Vec3f origin, Vec3f bounds, int depth) {
   this->origin = origin;
   this->bounds = bounds;
   this->depth = depth;
+  memset(this->children, 0, 8*sizeof(OctNode<T> *));
 }
 
 template <typename T>
@@ -148,7 +149,7 @@ OctNode<T> * OctNode<T>::get_node(Vec3f point) {
 }
 
 template <typename T>
-void OctNode<T>::add_point(Vec3f point, T data) {
+void OctNode<T>::add_point(Vec3f point, T data0) {
   if(!this->internal  && !this->occupied) {
     this->data.push_back(std::make_pair(point, data));
     this->occupied = true;
@@ -158,10 +159,16 @@ void OctNode<T>::add_point(Vec3f point, T data) {
     // convert to internal node
     auto e = this->data[0];
     auto loc = e.first;
-    auto data = e.second;
+    auto data1 = e.second;
     this->data.pop_back();
-    
+
+    OctNode *node = this->get_node(loc);
+    node->add_point(loc, data1);
+    this->occupied = false;
   }
+
+  OctNode *node = this->get_node(point);
+  node->add_point(point, data0);
 
 }
 
