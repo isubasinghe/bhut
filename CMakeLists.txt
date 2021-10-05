@@ -4,10 +4,11 @@ project(bhut)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_BUILD_TYPE Release)
 
-find_package(Magnum CONFIG REQUIRED)
 
 include_directories("${CMAKE_CURRENT_SOURCE_DIR}/includes")
 
 add_executable(bhut main.cpp)
+target_compile_options(bhut PRIVATE -static-libstdc++ -static -O3 -pedantic -Wall)
 
-target_link_libraries(bhut PRIVATE Magnum::Magnum)
+add_executable(transform transform.cpp)
+
