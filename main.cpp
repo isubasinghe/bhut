@@ -6,10 +6,13 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cassert>
 #include <sys/mman.h>
 /* #include <mpi.h>
 #include <omp.h> */
 #include <cmath>
+
+#define PODVECTOR_GROWTH_FACTOR 2
 
 #define OCTANT_ppp 0
 #define OCTANT_npp 1
@@ -47,19 +50,18 @@ class Vec3f {
     float x;
     float y;
     float z;
-    Vec3f(float x,float y, float z);
-    ~Vec3f();
     void zero();
 };
 
-Vec3f::Vec3f(float x, float y, float z) {
-  this->x = x;
-  this->y = y;
-  this->z = z;
-}
+// ensure the same memory layout as a struct such that we can use this in OpenMP
+static_assert(std::is_pod<Vec3f>::value, "Must be a POD type");
 
-Vec3f::~Vec3f() {
-
+Vec3f vec3f(float x, float y, float z) {
+  Vec3f v;
+  v.x = x;
+  v.y = y;
+  v.z = z;
+  return v;
 }
 
 void Vec3f::zero() {
@@ -68,9 +70,120 @@ void Vec3f::zero() {
   this->z = 0;
 }
 
-// OctTree is built on the unit cube
+template <typename T>
+class PODVector {
+  public:
+    // cant use private because it would not be a POD
+    // Fuck C++, all my homies hate C++
+    T *__internal_data;
+    size_t __internal_num;
+    size_t __internal_cap;
+    void push_back(T data);
+    // grow internal buffer according to internal buffer
+    void grow();
+    void shrink();
+    void remove(size_t index);
+    void clear();
+    size_t size();
+
+    T& operator[](size_t index) {
+      assert(index >= 0);
+      assert(index < this->__internal_num);
+      return this->__internal_data[index];
+    }
+
+  static_assert(std::is_pod<T>::value, "T must be of POD type");
+};
 
 template <typename T>
+PODVector<T> podvector() {
+  PODVector<T> p;
+  p.__internal_data = new T[2];
+  p.__internal_cap = 2;
+  p.__internal_num = 0;
+  return p;
+}
+
+
+template <typename T>
+void PODVector<T>::push_back(T data) {
+  if(this->__internal_num + 8 >= this->__internal_cap) {
+    this->grow();
+  }  
+  this->__internal_data[this->__internal_num] = data;
+  this->__internal_num += 1;
+
+}
+
+template <typename T>
+void PODVector<T>::grow() {
+  auto tmp = this->__internal_data;
+  auto new_data = new T[this->__internal_cap * 2];
+  memcpy(new_data, tmp, sizeof(T) * this->__internal_num);
+  this->__internal_cap = this->__internal_cap *2;
+  delete[] tmp;
+}
+
+template <typename T>
+void PODVector<T>::shrink() {
+  auto tmp = this->__internal_data;
+  auto new_data = new T[this->__internal_num];
+  memcpy(new_data, tmp, sizeof(T) * this->__internal_num);
+  this->__internal_cap = this->__internal_num;
+  delete[] tmp;
+}
+
+template <typename T>
+void PODVector<T>::clear() {
+  this->__internal_num = 0;
+  this->shrink();
+}
+
+template <typename T>
+void PODVector<T>::remove(size_t index) {
+  if(this->__internal_num + 8 >= this->__internal_cap) {
+    this->grow();
+  }
+  if(index >= this->__internal_num) {
+    return;
+  }
+
+  this[index] = this[this->__internal_num-1];
+  this->__internal_num -= 1;
+
+}
+
+template <typename T>
+size_t PODVector<T>::size() {
+  return this->__internal_num;
+}
+
+static_assert(std::is_pod<PODVector<int>>::value, "Seems like PODVector is not POD itself");
+
+class Planet {
+  public:
+    Vec3f point;
+    float charge;
+};
+
+Planet planet(Vec3f point, float charge) {
+  Planet p;
+  p.point = point;
+  p.charge = charge;
+  return p;
+}
+
+Planet planet(float x, float y, float z, float charge) {
+  Planet p;
+  p.point = vec3f(x,y,z);
+  p.charge = charge;
+  return p;
+}
+
+static_assert(std::is_pod<Planet>::value, "Planet should be of a POD type");
+
+// OctTree is built on the unit cube
+
 class OctNode {
   public:
     bool internal;
@@ -79,35 +192,38 @@ class OctNode {
     static const int max_depth = 3;
     Vec3f origin;
     Vec3f bounds;
-    std::vector<std::pair<Vec3f, T>> data; 
-    OctNode<T> *children[8];
-    OctNode(Vec3f, Vec3f, int);
-    void add_point(Vec3f point, T data);
+    Vec3f velocity;
+    Vec3f com;
+    PODVector<Planet> planets;
+    OctNode *children[8];
+    void add_point(Planet planet);
     OctNode *get_node(Vec3f point);
-    ~OctNode();
 };
 
+static_assert(std::is_pod<OctNode>::value, "OctNode must be a POD and T must be a POD");
 
-template <typename T>
-OctNode<T>::OctNode(Vec3f origin, Vec3f bounds, int depth) {
-  this->internal = false;
-  this->occupied = false;
-  this->origin = origin;
-  this->bounds = bounds;
-  this->depth = depth;
-  memset(this->children, 0, 8*sizeof(OctNode<T> *));
+OctNode *octnode(Vec3f origin, Vec3f bounds, int depth) {
+  OctNode *node = new OctNode;
+  node->internal = false;
+  node->occupied = false;
+  node->depth = depth;
+  node->origin = origin;
+  node->bounds = bounds;
+  node->velocity.zero();
+  node->com.zero();
+  node->planets = podvector<Planet>(); 
+  
+  memset(node->children, 0, sizeof(OctNode *) * 8);
+
+  return node;
+  
 }
 
-template <typename T>
-OctNode<T>::~OctNode() {
 
-}
-
-template <typename T>
-OctNode<T> * OctNode<T>::get_node(Vec3f point) {
+OctNode *OctNode::get_node(Vec3f point) {
   int index = 0;
-  Vec3f bounds(this->bounds.x/2, this->bounds.y/2, this->bounds.z/2);
-  Vec3f origin(0,0,0);
+  Vec3f bounds = vec3f(this->bounds.x/2, this->bounds.y/2, this->bounds.z/2);
+  Vec3f origin = vec3f(0,0,0);
 
   if(point.x > this->origin.x) {
     if(point.y > this->origin.y) { 
@@ -143,33 +259,31 @@ OctNode<T> * OctNode<T>::get_node(Vec3f point) {
   origin.z = point.z > this->origin.z ? (this->origin.z + this->bounds.z/2) : (this->origin.z - this->bounds.z/2);
   
   if(this->children[index] == nullptr) {
-    this->children[index] = new OctNode(origin, bounds, this->depth + 1);
+    this->children[index] = octnode(origin, bounds, this->depth + 1);
   }
   return this->children[index];
 }
 
-template <typename T>
-void OctNode<T>::add_point(Vec3f point, T data0) {
+void OctNode::add_point(Planet planet) {
   if(!this->internal  && !this->occupied) {
-    this->data.push_back(std::make_pair(point, data));
+    this->planets.push_back(planet);
     this->occupied = true;
     return;
   } 
+
   if(!this->internal && this->occupied) {
     // convert to internal node
-    auto e = this->data[0];
-    auto loc = e.first;
-    auto data1 = e.second;
-    this->data.pop_back();
-
-    OctNode *node = this->get_node(loc);
-    node->add_point(loc, data1);
+    for(size_t i=0; i < this->planets.size(); i++) {
+      OctNode *child = this->get_node(this->planets[i].point);
+      child->add_point(this->planets[i]);
+    }
+    this->planets.clear();
     this->occupied = false;
     this->internal = true;
   }
   
-  OctNode *node = this->get_node(point);
-  node->add_point(point, data0);
+  OctNode *node = this->get_node(planet.point);
+  node->add_point(planet);
 
 }
 
@@ -177,40 +291,36 @@ void OctNode<T>::add_point(Vec3f point, T data0) {
 // OctTree built on the unit cube
 // The domain is [[-1,1],[-1,1],[-1,1]]
 // Extra care should be taken in order to avoid going over this domain
-template <typename T>
 class OctTree {
   public: 
-    std::set<OctNode<T>*> internal; 
-    std::set<OctNode<T>*> leafs;
-    OctNode<T> *children[8];
+    std::set<OctNode *> internal; 
+    std::set<OctNode *> leafs;
+    OctNode *children[8];
     OctTree();
     ~OctTree();
-    void add_point(float x, float y, float z, T data);
+    void add_point(Planet planet);
 };
 
 
-template <typename T> 
-OctTree<T>::OctTree() {
-  memset(this->children, 0, 8 * sizeof(OctNode<T> *)); 
+OctTree::OctTree() {
+  memset(this->children, 0, 8 * sizeof(OctNode *)); 
 }
 
 
 
-template <typename T> 
-OctTree<T>::~OctTree() {
+OctTree::~OctTree() {
 }
 
-template <typename T>
-void OctTree<T>::add_point(float x, float y, float z, T data) {
+void OctTree::add_point(Planet planet) {
   int index = 0;
-  Vec3f bounds(0.5,0.5,0.5);
-  Vec3f origin(0,0,0);
-
-  if(x > 0) {
+  Vec3f bounds = vec3f(0.5,0.5,0.5);
+  Vec3f origin = vec3f(0,0,0);
+  
+  if(planet.point.x > 0) {
     origin.x = 0.5;
-    if(y > 0) {
+    if(planet.point.y > 0) {
       origin.y = 0.5;
-      if(z > 0) {
+      if(planet.point.z > 0) {
         origin.z = 0.5;
         index = OCTANT_ppp;
       }else {
@@ -219,7 +329,7 @@ void OctTree<T>::add_point(float x, float y, float z, T data) {
       }
     }else {
       origin.y = -0.5;
-      if(z >0) {
+      if(planet.point.z >0) {
         origin.z = 0.5;
         index = OCTANT_pnp;
       }else {
@@ -229,9 +339,9 @@ void OctTree<T>::add_point(float x, float y, float z, T data) {
     }
   }else {
     origin.x = -0.5;
-    if(y > 0) {
+    if(planet.point.y > 0) {
       origin.y = 0.5;
-      if(z >0) {
+      if(planet.point.z >0) {
         origin.z = 0.5;
         index = OCTANT_npp;
       }else {
@@ -240,7 +350,7 @@ void OctTree<T>::add_point(float x, float y, float z, T data) {
       }
     }else {
       origin.y = -0.5;
-      if(z > 0) {
+      if(planet.point.z > 0) {
         origin.z = 0.5;
         index = OCTANT_nnp;    
       }else {
@@ -251,15 +361,16 @@ void OctTree<T>::add_point(float x, float y, float z, T data) {
   }
 
   if(this->children[index] == nullptr) {
-    this->children[index] = new OctNode<T>(origin, bounds, 1);
+    this->children[index] = octnode(origin, bounds, 1);
   }
-  this->children[index]->add_point(Vec3f(x,y,z), data);
+  this->children[index]->add_point(planet);
 }
 
 
 int main(int argc, char *argv[]) {
-  OctTree<int> *tree = new OctTree<int>();
-
+  OctTree *tree = new OctTree();
+  Planet p = planet(0.78, 0.99, 0.76, 0.1);
+  tree->add_point(p);
   delete tree;
   return 0;
 }
