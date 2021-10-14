@@ -84,6 +84,7 @@ class PODVector {
     void shrink();
     void remove(size_t index);
     void clear();
+    void free();
     size_t size();
 
     T& operator[](size_t index) {
@@ -112,7 +113,6 @@ void PODVector<T>::push_back(T data) {
   }  
   this->__internal_data[this->__internal_num] = data;
   this->__internal_num += 1;
-
 }
 
 template <typename T>
@@ -121,6 +121,7 @@ void PODVector<T>::grow() {
   auto new_data = new T[this->__internal_cap * 2];
   memcpy(new_data, tmp, sizeof(T) * this->__internal_num);
   this->__internal_cap = this->__internal_cap *2;
+  this->__internal_data = new_data;
   delete[] tmp;
 }
 
@@ -156,6 +157,11 @@ void PODVector<T>::remove(size_t index) {
 template <typename T>
 size_t PODVector<T>::size() {
   return this->__internal_num;
+}
+
+template <typename T>
+void PODVector<T>::free() {
+  delete[] this->__internal_data;
 }
 
 static_assert(std::is_pod<PODVector<int>>::value, "Seems like PODVector is not POD itself");
@@ -368,9 +374,10 @@ void OctTree::add_point(Planet planet) {
 
 
 int main(int argc, char *argv[]) {
-  OctTree *tree = new OctTree();
+
   Planet p = planet(0.78, 0.99, 0.76, 0.1);
-  tree->add_point(p);
-  delete tree;
+  PODVector<Planet> planets = podvector<Planet>();
+  planets.push_back(p);
+  planets.free();
   return 0;
 }
