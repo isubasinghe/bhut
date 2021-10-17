@@ -7,9 +7,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cassert>
+#include <cstddef>
 #include <sys/mman.h>
-/* #include <mpi.h>
-#include <omp.h> */
+#include <mpi.h>
+#include <omp.h>
 #include <cmath>
 #include <queue>
 #include <algorithm>
@@ -43,9 +44,16 @@ class Vec3f {
     }
 };
 
+MPI_Datatype vec3f_internal_types[3] = {MPI_DOUBLE, MPI_DOUBLE, MPI_DOUBLE};
+int vec3f_lengths[3] = {1,1,1};
+int vec3f_count = 3;
+MPI_Aint vec3f_offsets[3] = {offsetof(Vec3f, x), offsetof(Vec3f, y), offsetof(Vec3f, z)};
+MPI_Datatype vec3f_dtype;
+
 std::ostream &operator<<(std::ostream &os, Vec3f const &m) {
   return os << "(" << m.x << ", " << m.y << ", " << m.z << ")";
 }
+
 // ensure the same memory layout as a struct such that we can use this in OpenMP
 static_assert(std::is_pod<Vec3f>::value, "Must be a POD type");
 
@@ -82,7 +90,7 @@ class PODVector {
 
     T& operator[](size_t index) {
       assert(index >= 0);
-      assert(index < this->__internal_num);
+      assert(index < this->_internal_num);
       return this->_internal_data[index];
     }
 
@@ -162,8 +170,16 @@ static_assert(std::is_pod<PODVector<int>>::value, "Seems like PODVector is not P
 class Planet {
   public:
     Vec3f point;
+    Vec3f velocity;
     double charge;
+    unsigned int id;
 };
+
+MPI_Datatype planet_internals[3] = {vec3f_dtype, vec3f_dtype, MPI_DOUBLE};
+int planet_lengths[3] = {1,1, 1};
+int planet_count = 3;
+MPI_Aint planet_offsets[3] = {offsetof(Planet, point), offsetof(Planet, velocity), offsetof(Planet, charge)};
+MPI_Datatype planet_dtype;
 
 Planet planet(Vec3f point, double charge) {
   Planet p{};
@@ -181,29 +197,31 @@ Planet planet(double x, double y, double z, double charge) {
 
 static_assert(std::is_pod<Planet>::value, "Planet should be of a POD type");
 
-// OctTree is built on the unit cube
 
+// depth of OctNode is limited by morton id
+// max_depth = ceil(bitsof(mortonid)/3)
 class OctNode {
   public:
     bool internal;
     bool occupied;
     unsigned int depth;
     unsigned long long mortonid;
-    static const int max_depth = 6;
+    static const int max_depth = 3;
     Vec3f origin;
     Vec3f bounds;
-    Vec3f velocity;
     Vec3f com;
+    double charge;
     PODVector<Planet> planets;
+    OctNode *parent;
     OctNode *children[NUM_OCTANTS];
-    void add_point(Planet planet, std::set<OctNode *> &internal, std::set<OctNode *> &leafs);
+    void add_point(Planet planet, std::set<OctNode *> &leafs);
     OctNode *get_node(Vec3f point);
     void free();
 };
 
 static_assert(std::is_pod<OctNode>::value, "OctNode must be a POD");
 
-OctNode *octnode(Vec3f origin, Vec3f bounds, unsigned int depth, unsigned long long mortonid) {
+OctNode *octnode(Vec3f origin, Vec3f bounds, unsigned int depth, unsigned long long mortonid, OctNode *parent) {
   auto *node = new OctNode;
   node->internal = false;
   node->occupied = false;
@@ -211,10 +229,10 @@ OctNode *octnode(Vec3f origin, Vec3f bounds, unsigned int depth, unsigned long l
   node->mortonid = mortonid;
   node->origin = origin;
   node->bounds = bounds;
-  node->velocity.zero();
   node->com.zero();
+  node->charge = 0.0;
   node->planets = podvector<Planet>(); 
-  
+  node->parent = parent; 
   memset(node->children, 0, sizeof(OctNode *) * 8);
 
   return node;
@@ -262,31 +280,39 @@ OctNode *OctNode::get_node(Vec3f point) {
 
   unsigned long long new_mortonid = (this->mortonid << 3) | mortonmaps[index];
   if(this->children[index] == nullptr) {
-    this->children[index] = octnode(new_origin, new_bounds, this->depth + 1, new_mortonid);
+    this->children[index] = octnode(new_origin, new_bounds, this->depth + 1, new_mortonid, this);
   }
   return this->children[index];
 }
 
-void OctNode::add_point(Planet planet, std::set<OctNode *> &internal, std::set<OctNode *> &leaf) {
+void OctNode::add_point(Planet planet, std::set<OctNode *> &leaf) {
   if(!this->internal  && !this->occupied) {
     this->planets.push_back(planet);
     this->occupied = true;
+    this->com = planet.point;
+    this->charge = planet.charge;
     leaf.insert(this);
     return;
   } 
 
+  double xcom = ((this->charge * this->com.x) + (this->charge * planet.point.x))/(this->charge + planet.charge);
+  double ycom = ((this->charge * this->com.y) + (this->charge * planet.point.y))/(this->charge + planet.charge);
+  double zcom = ((this->charge * this->com.z) + (this->charge * planet.point.z))/(this->charge + planet.charge);
+
+  this->com = vec3f(xcom, ycom, zcom);
+  this->charge += planet.charge;
+
   if(!this->internal && this->occupied) {
     // same so we insert
-    if(this->planets[0].point == planet.point || this->depth >= OctNode::max_depth) {
+    if(this->planets[0].point == planet.point || this->depth >= OctNode::max_depth) { 
       this->planets.push_back(planet);
       return;
     }
     leaf.erase(this);
-    internal.insert(this);
     // convert to internal node
     for(size_t i=0; i < this->planets.size(); i++) {
       OctNode *child = this->get_node(this->planets[i].point);
-      child->add_point(this->planets[i], internal, leaf);
+      child->add_point(this->planets[i], leaf);
     }
     this->planets.clear();
     this->occupied = false;
@@ -294,47 +320,48 @@ void OctNode::add_point(Planet planet, std::set<OctNode *> &internal, std::set<O
   }
   
   OctNode *node = this->get_node(planet.point);
-  node->add_point(planet, internal, leaf);
-
+  node->add_point(planet, leaf);
 }
 
 void OctNode::free() {
   this->planets.free();
 }
 
-// OctTree built on the unit cube
+
 // The domain is [[-1,1],[-1,1],[-1,1]]
 // Extra care should be taken in order to avoid going over this domain
 // Why is this separate to OctNode ? Because OctNode is POD and OctTree is locally held
 // so doesnt need to be POD.
 class OctTree {
   public: 
-    std::set<OctNode *> internal; 
     std::set<OctNode *> leafs;
+    OctNode *root;
     OctNode *children[NUM_OCTANTS];
+    double theta;
     OctTree();
     ~OctTree();
     void add_point(Planet planet);
+    void compute();
+    void calcforces(OctNode *node, Planet &planet, Vec3f &forces);
 };
 
 
 OctTree::OctTree() {
   memset(this->children, 0, NUM_OCTANTS * sizeof(OctNode *));
+  this->theta = 1.0;
+  this->root = octnode(vec3f(0.5, 0.5, 0.5), vec3f(0.5, 0.5, 0.5), 1, 0, nullptr);
 }
 
 OctTree::~OctTree() {
 
-  std::vector<OctNode *> nodes(this->leafs.begin(), this->leafs.end());
+  /* std::vector<OctNode *> nodes(this->leafs.begin(), this->leafs.end());
   std::sort(nodes.begin(), nodes.end(), [](const OctNode *lhs, const OctNode *rhs) {
     return lhs->mortonid < rhs->mortonid;
   });
 
   for(auto node: nodes) {
-    if(node->internal && node->planets.size() > 0) {
-      exit(1);
-    }
      std::cout << "ORIGIN: " << node->origin << "\t BOUNDS: " << node->bounds << "\t INTERNAL: " << node->internal << "\tPLANETS: " << node->planets.size() << "\n";
-  }
+  } */
 
   std::queue<OctNode *> queue;
   for(auto & child : this->children) {
@@ -357,65 +384,63 @@ OctTree::~OctTree() {
 }
 
 void OctTree::add_point(Planet planet) {
-  int index;
-  Vec3f bounds = vec3f(0.5,0.5,0.5);
-  Vec3f origin = vec3f(0,0,0);
-  
-  if(planet.point.x > 0) {
-    origin.x = 0.5;
-    if(planet.point.y > 0) {
-      origin.y = 0.5;
-      if(planet.point.z > 0) {
-        origin.z = 0.5;
-        index = OCTANT_ppp;
-      }else {
-        origin.z = -0.5;
-        index = OCTANT_ppn; 
-      }
-    }else {
-      origin.y = -0.5;
-      if(planet.point.z >0) {
-        origin.z = 0.5;
-        index = OCTANT_pnp;
-      }else {
-        origin.z = -0.5;
-        index = OCTANT_pnn;
-      }
-    }
-  }else {
-    origin.x = -0.5;
-    if(planet.point.y > 0) {
-      origin.y = 0.5;
-      if(planet.point.z >0) {
-        origin.z = 0.5;
-        index = OCTANT_npp;
-      }else {
-        origin.z = -0.5;
-        index = OCTANT_npn;
-      }
-    }else {
-      origin.y = -0.5;
-      if(planet.point.z > 0) {
-        origin.z = 0.5;
-        index = OCTANT_nnp;    
-      }else {
-        origin.z = -0.5;
-        index = OCTANT_nnn;
-      }
-    }
-  }
+  this->root->add_point(planet, this->leafs); 
+}
 
-  if(this->children[index] == nullptr) {
-    this->children[index] = octnode(origin, bounds, 1, mortonmaps[index]);
+double distance(Vec3f a, Vec3f b) {
+  return sqrt(pow(a.x-b.x, 2.0) + pow(a.y - b.y, 2.0) + pow(a.z-b.z, 2.0)); 
+}
+
+void naiveforces(OctNode *node, Planet &planet) {
+  std::queue<OctNode *> nodes; 
+  nodes.push(node);
+  while(!nodes.empty()) {
+    OctNode *curr = nodes.front();
+    if(curr->internal) {
+      nodes.pop();
+      for(auto next: curr->children) {
+        if(next != NULL) {
+          nodes.push(next);
+        }
+      }
+      continue;
+    }
+    
   }
-  this->children[index]->add_point(planet, this->internal, this->leafs);
+}
+
+void OctTree::calcforces(OctNode *node, Planet &planet, Vec3f &forces) {
+  for(auto child: node->children) {
+    if(child != nullptr) {
+      double s = child->bounds.x*2; 
+      double d = distance(planet.point, child->com);
+      if(s/d < this->theta) {
+         
+      }else {
+
+      }
+    }
+  } 
+}
+
+void OctTree::compute() {
+  PODVector<Planet> newplanets = podvector<Planet>();
+  for(auto node: this->leafs) {
+    for(size_t i = 0; i < node->planets.size(); i++) {
+      Planet p = node->planets[i];
+      Vec3f forces;
+      calcforces(this->root, p, forces);
+    }
+  } 
 }
 
 double randf(double min, double max) {
   return ((double(rand()) / double(RAND_MAX)) * (max - min)) + min;
 }
 
-int main(int argc, char *argv[]) {
+
+int main(int argc, char *argv[]) {  
+  double theta = 0.3;
 
   Planet p = planet(0.78, 0.99, 0.76, 0.1);
   PODVector<Planet> planets = podvector<Planet>();
@@ -429,11 +454,11 @@ int main(int argc, char *argv[]) {
   planets.free();
 
   auto *tree = new OctTree();
-
-  for(int i = 0; i < 10000000; i++) {
-    p.point.x = randf(-1, 1);
-    p.point.y = randf(-1, 1);
-    p.point.z = randf(-1, 1);
+  for(int i=0; i < 100; i++) {
+    p.point.x = randf(0.0, 1.0);
+    p.point.y = randf(0.0, 1.0);
+    p.point.z = randf(0.0, 1.0);
+    p.charge = 0.1;
     tree->add_point(p);
   }
   tree->add_point(p);
