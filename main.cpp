@@ -19,7 +19,7 @@
 #define PODVECTOR_GROWTH_FACTOR 2
 #define PODVECTOR_GROWTH_PADDING 8
 #define NUM_OCTANTS 8
-
+#define GRAVITY_CONSTANT 0.000000000066742
 #define OCTANT_ppp 0
 #define OCTANT_npp 1
 #define OCTANT_pnp 2
@@ -337,12 +337,18 @@ class OctTree {
     std::set<OctNode *> leafs;
     OctNode *root;
     OctNode *children[NUM_OCTANTS];
+    Vec3f trans;
+    double factor;
     double theta;
+    double minx;
+    double miny;
+    double minz;
     OctTree();
     ~OctTree();
     void add_point(Planet planet);
     void compute();
     void calcforces(OctNode *node, Planet &planet, Vec3f &forces);
+    Vec3f naiveforces(OctNode *node, Planet &planet);
 };
 
 
@@ -391,7 +397,9 @@ double distance(Vec3f a, Vec3f b) {
   return sqrt(pow(a.x-b.x, 2.0) + pow(a.y - b.y, 2.0) + pow(a.z-b.z, 2.0)); 
 }
 
-void naiveforces(OctNode *node, Planet &planet) {
+Vec3f OctTree::naiveforces(OctNode *node, Planet &planet) {
+  Vec3f forces = vec3f(0,0,0);
+
   std::queue<OctNode *> nodes; 
   nodes.push(node);
   while(!nodes.empty()) {
@@ -405,19 +413,45 @@ void naiveforces(OctNode *node, Planet &planet) {
       }
       continue;
     }
-    
+  
+    // compute force exerted by planets in this octant
+    for(size_t i = 0; i < curr->planets.size(); i++) {
+
+      double mag3 = pow(distance(curr->planets[i].point, planet.point), 3);
+      double fx = GRAVITY_CONSTANT * (curr->planets[i].charge) * planet.charge * (curr->planets[i].point.x - planet.point.x);
+      forces.x = fx/mag3;
+       
+      double fy = GRAVITY_CONSTANT * (curr->planets[i].charge) * planet.charge * (curr->planets[i].point.y - planet.point.y);
+      forces.y = fy/mag3;
+      
+      double fz = GRAVITY_CONSTANT * (curr->planets[i].charge) * planet.charge * (curr->planets[i].point.z - planet.point.z);
+      forces.z = fz/mag3;
+
+    }
+
   }
+  return forces;
 }
 
 void OctTree::calcforces(OctNode *node, Planet &planet, Vec3f &forces) {
+  
   for(auto child: node->children) {
     if(child != nullptr) {
       double s = child->bounds.x*2; 
       double d = distance(planet.point, child->com);
       if(s/d < this->theta) {
-         
+        double mag3 = pow(distance(child->com, planet.point), 3); 
+        double fx = GRAVITY_CONSTANT * (child->charge) * planet.charge * (child->com.x - planet.point.x);
+        forces.x = fx/mag3;
+        double fy = GRAVITY_CONSTANT * (child->charge) * planet.charge * (child->com.y - planet.point.y);
+        forces.y = fy/mag3;
+        double fz = GRAVITY_CONSTANT * (child->charge) * planet.charge * (child->com.z - planet.point.z);
+        forces.z = fz/mag3;
       }else {
-
+        Vec3f newforces = this->naiveforces(node, planet);
+        forces.x += newforces.x;
+        forces.y += newforces.y;
+        forces.z += newforces.z;
       }
     }
   } 
@@ -428,7 +462,7 @@ void OctTree::compute() {
   for(auto node: this->leafs) {
     for(size_t i = 0; i < node->planets.size(); i++) {
       Planet p = node->planets[i];
-      Vec3f forces;
+      Vec3f forces = vec3f(0,0,0);
       calcforces(this->root, p, forces);
     }
   } 
