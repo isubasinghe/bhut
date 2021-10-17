@@ -337,13 +337,9 @@ class OctTree {
     std::set<OctNode *> leafs;
     OctNode *root;
     OctNode *children[NUM_OCTANTS];
-    Vec3f trans;
-    double factor;
     double theta;
-    double minx;
-    double miny;
-    double minz;
     OctTree();
+    OctTree(Vec3f origin, Vec3f bounds);
     ~OctTree();
     void add_point(Planet planet);
     void compute();
@@ -358,16 +354,13 @@ OctTree::OctTree() {
   this->root = octnode(vec3f(0.5, 0.5, 0.5), vec3f(0.5, 0.5, 0.5), 1, 0, nullptr);
 }
 
+OctTree::OctTree(Vec3f origin, Vec3f bounds) {
+  memset(this->children, 0, NUM_OCTANTS * sizeof(OctNode *));
+  this->theta = 1.0;
+  this->root = octnode(origin, bounds, 1, 0, nullptr);
+}
+
 OctTree::~OctTree() {
-
-  /* std::vector<OctNode *> nodes(this->leafs.begin(), this->leafs.end());
-  std::sort(nodes.begin(), nodes.end(), [](const OctNode *lhs, const OctNode *rhs) {
-    return lhs->mortonid < rhs->mortonid;
-  });
-
-  for(auto node: nodes) {
-     std::cout << "ORIGIN: " << node->origin << "\t BOUNDS: " << node->bounds << "\t INTERNAL: " << node->internal << "\tPLANETS: " << node->planets.size() << "\n";
-  } */
 
   std::queue<OctNode *> queue;
   for(auto & child : this->children) {
@@ -474,30 +467,42 @@ double randf(double min, double max) {
 
 
 int main(int argc, char *argv[]) {  
-  double theta = 0.3;
 
-  Planet p = planet(0.78, 0.99, 0.76, 0.1);
-  PODVector<Planet> planets = podvector<Planet>();
-  for(int i=0; i < 10; i++) {
+  MPI_Init(&argc, &argv);
+  
+  int size,rank;
+  MPI_Comm_size(MPI_COMM_WORLD, &size);
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+  MPI_Type_create_struct(planet_count, planet_lengths, planet_offsets, planet_internals, &planet_dtype);
+
+  FILE *fp = fopen("planets.txt", "rb");
+  if(fp == NULL) {
+    return 1;
+  } 
+  size_t i = 0;
+
+  while(true && rank==0) {
+    std::vector<Planet> planets;
+    double mass,x,y,z,vx,vy,vz;
+    int ret = fscanf(fp, "%lf %lf %lf %lf %lf %lf %lf", &mass, &x, &y, &z, &vx, &vy, &vz);
+    if(ret != 7) {
+      break;
+    }
+    Planet p;
+    p.charge = mass;
+    p.point = vec3f(x,y,z);
+    p.velocity = vec3f(vx, vy, vz);
     planets.push_back(p);
-  }
-  planets.remove(0);
-  planets.shrink();
-  planets.clear();
-  planets.push_back(p);
-  planets.free();
+    
 
-  auto *tree = new OctTree();
-  for(int i=0; i < 100; i++) {
-    p.point.x = randf(0.0, 1.0);
-    p.point.y = randf(0.0, 1.0);
-    p.point.z = randf(0.0, 1.0);
-    p.charge = 0.1;
-    tree->add_point(p);
   }
-  tree->add_point(p);
-  tree->add_point(p);
 
-  delete tree;
+
+  fclose(fp);
+ 
+  MPI_Type_free(&planet_dtype); 
+  MPI_Finalize();
+
   return 0;
 }
