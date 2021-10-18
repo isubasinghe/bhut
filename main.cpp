@@ -20,6 +20,7 @@
 #define PODVECTOR_GROWTH_PADDING 8
 #define NUM_OCTANTS 8
 #define GRAVITY_CONSTANT 0.000000000066742
+#define LEAPFROG_DELTA_T 0.01
 #define OCTANT_ppp 0
 #define OCTANT_npp 1
 #define OCTANT_pnp 2
@@ -44,11 +45,7 @@ class Vec3f {
     }
 };
 
-MPI_Datatype vec3f_internal_types[3] = {MPI_DOUBLE, MPI_DOUBLE, MPI_DOUBLE};
-int vec3f_lengths[3] = {1,1,1};
-int vec3f_count = 3;
-MPI_Aint vec3f_offsets[3] = {offsetof(Vec3f, x), offsetof(Vec3f, y), offsetof(Vec3f, z)};
-MPI_Datatype vec3f_dtype;
+
 
 std::ostream &operator<<(std::ostream &os, Vec3f const &m) {
   return os << "(" << m.x << ", " << m.y << ", " << m.z << ")";
@@ -172,14 +169,13 @@ class Planet {
     Vec3f point;
     Vec3f velocity;
     double charge;
-    unsigned int id;
+    int id;
 };
 
-MPI_Datatype planet_internals[3] = {vec3f_dtype, vec3f_dtype, MPI_DOUBLE};
-int planet_lengths[3] = {1,1, 1};
-int planet_count = 3;
-MPI_Aint planet_offsets[3] = {offsetof(Planet, point), offsetof(Planet, velocity), offsetof(Planet, charge)};
-MPI_Datatype planet_dtype;
+std::ostream &operator<<(std::ostream &os, Planet const &m) {
+  return os << "PLANET POINT :" << m.point << "\t VEL: " << m.velocity << " CHARGE :" << m.charge;
+}
+
 
 Planet planet(Vec3f point, double charge) {
   Planet p{};
@@ -206,7 +202,7 @@ class OctNode {
     bool occupied;
     unsigned int depth;
     unsigned long long mortonid;
-    static const int max_depth = 3;
+    static const int max_depth = 6;
     Vec3f origin;
     Vec3f bounds;
     Vec3f com;
@@ -295,9 +291,9 @@ void OctNode::add_point(Planet planet, std::set<OctNode *> &leaf) {
     return;
   } 
 
-  double xcom = ((this->charge * this->com.x) + (this->charge * planet.point.x))/(this->charge + planet.charge);
-  double ycom = ((this->charge * this->com.y) + (this->charge * planet.point.y))/(this->charge + planet.charge);
-  double zcom = ((this->charge * this->com.z) + (this->charge * planet.point.z))/(this->charge + planet.charge);
+  double xcom = ((this->charge * this->com.x) + (planet.charge * planet.point.x))/(this->charge + planet.charge);
+  double ycom = ((this->charge * this->com.y) + (planet.charge * planet.point.y))/(this->charge + planet.charge);
+  double zcom = ((this->charge * this->com.z) + (planet.charge * planet.point.z))/(this->charge + planet.charge);
 
   this->com = vec3f(xcom, ycom, zcom);
   this->charge += planet.charge;
@@ -336,38 +332,30 @@ class OctTree {
   public: 
     std::set<OctNode *> leafs;
     OctNode *root;
-    OctNode *children[NUM_OCTANTS];
     double theta;
-    OctTree();
-    OctTree(Vec3f origin, Vec3f bounds);
+    int rank;
+    int size;
+    int planets;
+    OctTree(Vec3f origin, Vec3f bounds, int rank, int size);
     ~OctTree();
     void add_point(Planet planet);
-    void compute();
+    void compute(int div);
     void calcforces(OctNode *node, Planet &planet, Vec3f &forces);
     Vec3f naiveforces(OctNode *node, Planet &planet);
 };
 
-
-OctTree::OctTree() {
-  memset(this->children, 0, NUM_OCTANTS * sizeof(OctNode *));
-  this->theta = 1.0;
-  this->root = octnode(vec3f(0.5, 0.5, 0.5), vec3f(0.5, 0.5, 0.5), 1, 0, nullptr);
-}
-
-OctTree::OctTree(Vec3f origin, Vec3f bounds) {
-  memset(this->children, 0, NUM_OCTANTS * sizeof(OctNode *));
-  this->theta = 1.0;
+OctTree::OctTree(Vec3f origin, Vec3f bounds, int rank, int size) {
+  this->theta = 1.5;
   this->root = octnode(origin, bounds, 1, 0, nullptr);
+  this->rank = rank;
+  this->size = size;
+  this->planets = 0;
 }
 
 OctTree::~OctTree() {
 
   std::queue<OctNode *> queue;
-  for(auto & child : this->children) {
-    if(child != nullptr) {
-      queue.push(child);
-    }
-  }
+  queue.push(this->root);
 
   while(!queue.empty()) {
     auto node = queue.front();
@@ -383,6 +371,7 @@ OctTree::~OctTree() {
 }
 
 void OctTree::add_point(Planet planet) {
+  this->planets += 1;
   this->root->add_point(planet, this->leafs); 
 }
 
@@ -393,33 +382,32 @@ double distance(Vec3f a, Vec3f b) {
 Vec3f OctTree::naiveforces(OctNode *node, Planet &planet) {
   Vec3f forces = vec3f(0,0,0);
 
-  std::queue<OctNode *> nodes; 
+  std::queue<OctNode *> nodes;
   nodes.push(node);
   while(!nodes.empty()) {
     OctNode *curr = nodes.front();
+    nodes.pop();
     if(curr->internal) {
-      nodes.pop();
       for(auto next: curr->children) {
-        if(next != NULL) {
+        if(next != nullptr) {
           nodes.push(next);
         }
       }
       continue;
     }
-  
+
     // compute force exerted by planets in this octant
     for(size_t i = 0; i < curr->planets.size(); i++) {
 
       double mag3 = pow(distance(curr->planets[i].point, planet.point), 3);
       double fx = GRAVITY_CONSTANT * (curr->planets[i].charge) * planet.charge * (curr->planets[i].point.x - planet.point.x);
       forces.x = fx/mag3;
-       
+
       double fy = GRAVITY_CONSTANT * (curr->planets[i].charge) * planet.charge * (curr->planets[i].point.y - planet.point.y);
       forces.y = fy/mag3;
-      
+
       double fz = GRAVITY_CONSTANT * (curr->planets[i].charge) * planet.charge * (curr->planets[i].point.z - planet.point.z);
       forces.z = fz/mag3;
-
     }
 
   }
@@ -450,15 +438,35 @@ void OctTree::calcforces(OctNode *node, Planet &planet, Vec3f &forces) {
   } 
 }
 
-void OctTree::compute() {
+void OctTree::compute(int div) {
   PODVector<Planet> newplanets = podvector<Planet>();
   for(auto node: this->leafs) {
+    int chunk_size = this->planets/this->size + (this->planets % this->size);
+    int low_range = this->rank*chunk_size;
+    int high_range = (this->rank+1)*chunk_size;
     for(size_t i = 0; i < node->planets.size(); i++) {
       Planet p = node->planets[i];
+      if(p.id > high_range || p.id < low_range) {
+        continue;
+      }
+
       Vec3f forces = vec3f(0,0,0);
+
       calcforces(this->root, p, forces);
+      Vec3f acceleration = vec3f(forces.x/ p.charge, forces.y/p.charge, forces.z/p.charge);
+
+      Planet newplanet{};
+      newplanet.velocity = vec3f(p.velocity.x + (acceleration.x*LEAPFROG_DELTA_T)/div,
+                                 p.velocity.y + (acceleration.y*LEAPFROG_DELTA_T)/div,
+                                 p.velocity.z + (acceleration.z*LEAPFROG_DELTA_T)/div);
+      newplanet.point = vec3f(p.point.x + newplanet.velocity.x*LEAPFROG_DELTA_T,
+                              p.point.y + newplanet.velocity.y*LEAPFROG_DELTA_T,
+                              p.point.z + newplanet.velocity.z*LEAPFROG_DELTA_T);
+
+      newplanet.charge = p.charge;
+      newplanet.id = p.id;
     }
-  } 
+  }
 }
 
 double randf(double min, double max) {
@@ -473,36 +481,135 @@ int main(int argc, char *argv[]) {
   int size,rank;
   MPI_Comm_size(MPI_COMM_WORLD, &size);
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  
+  static const int vec3f_block_count = 3;
+  MPI_Datatype vec3f_dtype;
+  MPI_Aint vec3f_offsets[vec3f_block_count] = {offsetof(Vec3f, x), offsetof(Vec3f, y), offsetof(Vec3f, z)};
+  int vec3f_lengths[vec3f_block_count] = {1,1,1};
+  MPI_Datatype vec3f_internal_types[vec3f_block_count] = {MPI_DOUBLE, MPI_DOUBLE, MPI_DOUBLE};
 
-  MPI_Type_create_struct(planet_count, planet_lengths, planet_offsets, planet_internals, &planet_dtype);
+  MPI_Type_create_struct(vec3f_block_count, vec3f_lengths, vec3f_offsets, vec3f_internal_types, &vec3f_dtype);
+  MPI_Type_commit(&vec3f_dtype);
 
-  FILE *fp = fopen("planets.txt", "rb");
-  if(fp == NULL) {
-    return 1;
-  } 
-  size_t i = 0;
+  static const int planet_block_count=4;
+  MPI_Datatype planet_dtype;
+  MPI_Aint planet_offsets[planet_block_count] = {offsetof(Planet, point), offsetof(Planet, velocity), offsetof(Planet, charge), offsetof(Planet, id)};
+  int planet_lengths[planet_block_count] = {1,1,1,1};
+  MPI_Datatype planet_internal_types[planet_block_count] = {vec3f_dtype, vec3f_dtype, MPI_DOUBLE, MPI_INT};
 
-  while(true && rank==0) {
-    std::vector<Planet> planets;
-    double mass,x,y,z,vx,vy,vz;
-    int ret = fscanf(fp, "%lf %lf %lf %lf %lf %lf %lf", &mass, &x, &y, &z, &vx, &vy, &vz);
-    if(ret != 7) {
-      break;
+
+
+
+  MPI_Type_create_struct(planet_block_count, planet_lengths, planet_offsets, planet_internal_types, &planet_dtype);
+  MPI_Type_commit(&planet_dtype);
+
+  if(rank==0) {
+
+    FILE *fp = fopen("planets.txt", "rb");
+    if(fp == nullptr) {
+      std::cerr << "Unable to open file" << std::endl;
+      return 1;
     }
-    Planet p;
-    p.charge = mass;
-    p.point = vec3f(x,y,z);
-    p.velocity = vec3f(vx, vy, vz);
-    planets.push_back(p);
     
+    OctTree *tree;
+    double *low_x = nullptr;
+    double *high_x = nullptr;
+    double *low_y = nullptr;
+    double *high_y = nullptr;
+    double *low_z = nullptr;
+    double *high_z = nullptr;
+
+    std::vector<Planet> planets;
+    int id = 0;
+    while(true) {
+
+      double mass,x,y,z,vx,vy,vz;
+      int ret = fscanf(fp, "%lf %lf %lf %lf %lf %lf %lf", &mass, &x, &y, &z, &vx, &vy, &vz);
+
+
+      if(ret != 7) {
+        break;
+      }
+      if(low_x == nullptr) {
+        low_x = new double;
+        *low_x = x;
+        high_x = new double;
+        *high_x = x;
+      }
+      if(low_y == nullptr) {
+        low_y = new double;
+        *low_y = y;
+        high_y = new double;
+        *high_y = y;
+      }
+
+      if(low_z == nullptr) {
+        low_z = new double;
+        *low_z = z;
+        high_z = new double;
+        *high_z = z;
+      }
+
+      if(x < *low_x) {
+        *low_x = x;
+      }
+      if(x > *high_x) {
+        *high_x = x;
+      }
+
+      if(y < *low_y) {
+        *low_y = y;
+      }
+      if(y > *high_y) {
+        *high_y = y;
+      }
+
+      if(z < *low_z) {
+        *low_z = z;
+      }
+      if(z > *high_z) {
+        *high_z = z;
+      }
+
+      Planet p{};
+      p.charge = mass;
+      p.point = vec3f(x,y,z);
+      p.velocity = vec3f(vx, vy, vz);
+      p.id = id;
+      planets.push_back(p);
+      id += 1;
+
+    }
+
+    Vec3f origin = vec3f((*high_x + *low_x)/2, (*high_y + *low_y)/2, (*high_z + *low_z)/2);
+    double mymax = std::max(std::max(*high_x, *high_y), *high_z);
+    double mymin = std::min(std::min(*low_x, *low_y), *low_z);
+
+    double scbounds = (mymax-mymin)/2;
+
+    Vec3f bounds = vec3f(scbounds, scbounds, scbounds);
+    
+    tree = new OctTree(origin, bounds, 0, 8);
+    
+    for(auto planet: planets) {
+      tree->add_point(planet);  
+    }
+    tree->compute(2);
+
+    delete tree;
+    delete low_x;
+    delete high_x;
+    delete low_y;
+    delete high_y;
+    delete low_z;
+    delete high_z;
+
+    fclose(fp);
 
   }
-
-
-  fclose(fp);
- 
-  MPI_Type_free(&planet_dtype); 
+  
+  MPI_Type_free(&vec3f_dtype);
+  MPI_Type_free(&planet_dtype);
   MPI_Finalize();
-
   return 0;
 }
