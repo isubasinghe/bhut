@@ -629,12 +629,12 @@ int main(int argc, char *argv[]) {
 
   if(rank==0) {
     std::cout << "DONE IN " << ms.count() << "ms\n";
-    for(int i=0; i<n; i++) {
+    /* for(int i=0; i<n; i++) {
       Vec3f point = plnts[i].point;
       Vec3f velocity = plnts[i].velocity;
       double charge = plnts[i].charge;
       printf("%lf %lf %lf %lf %lf %lf %lf\n", charge, point.x, point.y, point.z, velocity.x, velocity.y, velocity.z);
-    }
+    } */
   }
 
   delete[] counts_recv;
