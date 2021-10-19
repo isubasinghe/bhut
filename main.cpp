@@ -30,8 +30,12 @@
 #define OCTANT_pnn 6
 #define OCTANT_nnn 7
 
+
+// Ran outta time to use these bad boys properly, wanted to perform load balancing via sorted morton ids for the fast multipole method.
 static unsigned long long mortonmaps[8] = {0b111, 0b011, 0b101, 0b001, 0b110, 0b010, 0b100, 0b000};
 
+// divsion used in leapfrog integration
+static int leapdiv = 2;
 
 class Vec3f {
   public:
@@ -68,11 +72,13 @@ void Vec3f::zero() {
   this->z = 0;
 }
 
+// Turns out I didn't need to write a fucking vector type 
+// but its neat + pretty performant, so I used it
 template <typename T>
 class PODVector {
   public:
     // cant use private because it would not be a POD
-    // Fuck C++, all my homies hate C++
+    // Fuck C++
     T *_internal_data;
     size_t _internal_num;
     size_t _internal_cap;
@@ -339,7 +345,7 @@ class OctTree {
     OctTree(Vec3f origin, Vec3f bounds, int rank, int size);
     ~OctTree();
     void add_point(Planet planet);
-    void compute(int div);
+    std::vector<Planet> compute();
     void calcforces(OctNode *node, Planet &planet, Vec3f &forces);
     Vec3f naiveforces(OctNode *node, Planet &planet);
 };
@@ -438,35 +444,39 @@ void OctTree::calcforces(OctNode *node, Planet &planet, Vec3f &forces) {
   } 
 }
 
-void OctTree::compute(int div) {
-  PODVector<Planet> newplanets = podvector<Planet>();
+std::vector<Planet> OctTree::compute() {
+  std::vector<Planet> newplanets;
+  int chunk_size = this->planets/this->size + (this->planets % this->size);
+  int low_range = this->rank*chunk_size;
+  int high_range = (this->rank+1)*chunk_size;
+  
   for(auto node: this->leafs) {
-    int chunk_size = this->planets/this->size + (this->planets % this->size);
-    int low_range = this->rank*chunk_size;
-    int high_range = (this->rank+1)*chunk_size;
     for(size_t i = 0; i < node->planets.size(); i++) {
       Planet p = node->planets[i];
-      if(p.id > high_range || p.id < low_range) {
+      // [low_range, high_range)
+      if(!(p.id >= low_range && p.id < high_range)) {
         continue;
       }
-
       Vec3f forces = vec3f(0,0,0);
 
       calcforces(this->root, p, forces);
       Vec3f acceleration = vec3f(forces.x/ p.charge, forces.y/p.charge, forces.z/p.charge);
 
       Planet newplanet{};
-      newplanet.velocity = vec3f(p.velocity.x + (acceleration.x*LEAPFROG_DELTA_T)/div,
-                                 p.velocity.y + (acceleration.y*LEAPFROG_DELTA_T)/div,
-                                 p.velocity.z + (acceleration.z*LEAPFROG_DELTA_T)/div);
+      newplanet.velocity = vec3f(p.velocity.x + (acceleration.x*LEAPFROG_DELTA_T)/leapdiv,
+                                 p.velocity.y + (acceleration.y*LEAPFROG_DELTA_T)/leapdiv,
+                                 p.velocity.z + (acceleration.z*LEAPFROG_DELTA_T)/leapdiv);
       newplanet.point = vec3f(p.point.x + newplanet.velocity.x*LEAPFROG_DELTA_T,
                               p.point.y + newplanet.velocity.y*LEAPFROG_DELTA_T,
                               p.point.z + newplanet.velocity.z*LEAPFROG_DELTA_T);
 
       newplanet.charge = p.charge;
       newplanet.id = p.id;
+      newplanets.push_back(newplanet);
     }
   }
+  leapdiv = 1;
+  return newplanets;
 }
 
 double randf(double min, double max) {
@@ -497,80 +507,30 @@ int main(int argc, char *argv[]) {
   int planet_lengths[planet_block_count] = {1,1,1,1};
   MPI_Datatype planet_internal_types[planet_block_count] = {vec3f_dtype, vec3f_dtype, MPI_DOUBLE, MPI_INT};
 
-
-
-
   MPI_Type_create_struct(planet_block_count, planet_lengths, planet_offsets, planet_internal_types, &planet_dtype);
   MPI_Type_commit(&planet_dtype);
 
-  if(rank==0) {
+  
+  
+  int n = 0;
+  Planet *plnts;
 
+  if(rank==0) {
+    
     FILE *fp = fopen("planets.txt", "rb");
     if(fp == nullptr) {
       std::cerr << "Unable to open file" << std::endl;
       return 1;
     }
     
-    OctTree *tree;
-    double *low_x = nullptr;
-    double *high_x = nullptr;
-    double *low_y = nullptr;
-    double *high_y = nullptr;
-    double *low_z = nullptr;
-    double *high_z = nullptr;
-
     std::vector<Planet> planets;
     int id = 0;
     while(true) {
-
       double mass,x,y,z,vx,vy,vz;
       int ret = fscanf(fp, "%lf %lf %lf %lf %lf %lf %lf", &mass, &x, &y, &z, &vx, &vy, &vz);
-
-
       if(ret != 7) {
         break;
       }
-      if(low_x == nullptr) {
-        low_x = new double;
-        *low_x = x;
-        high_x = new double;
-        *high_x = x;
-      }
-      if(low_y == nullptr) {
-        low_y = new double;
-        *low_y = y;
-        high_y = new double;
-        *high_y = y;
-      }
-
-      if(low_z == nullptr) {
-        low_z = new double;
-        *low_z = z;
-        high_z = new double;
-        *high_z = z;
-      }
-
-      if(x < *low_x) {
-        *low_x = x;
-      }
-      if(x > *high_x) {
-        *high_x = x;
-      }
-
-      if(y < *low_y) {
-        *low_y = y;
-      }
-      if(y > *high_y) {
-        *high_y = y;
-      }
-
-      if(z < *low_z) {
-        *low_z = z;
-      }
-      if(z > *high_z) {
-        *high_z = z;
-      }
-
       Planet p{};
       p.charge = mass;
       p.point = vec3f(x,y,z);
@@ -578,36 +538,88 @@ int main(int argc, char *argv[]) {
       p.id = id;
       planets.push_back(p);
       id += 1;
-
     }
-
-    Vec3f origin = vec3f((*high_x + *low_x)/2, (*high_y + *low_y)/2, (*high_z + *low_z)/2);
-    double mymax = std::max(std::max(*high_x, *high_y), *high_z);
-    double mymin = std::min(std::min(*low_x, *low_y), *low_z);
-
-    double scbounds = (mymax-mymin)/2;
-
-    Vec3f bounds = vec3f(scbounds, scbounds, scbounds);
-    
-    tree = new OctTree(origin, bounds, 0, 8);
-    
-    for(auto planet: planets) {
-      tree->add_point(planet);  
+    n = planets.size();
+    plnts = new Planet[n];
+    for(size_t i = 0; i < n; i++) {
+      plnts[i] = planets[i];
     }
-    tree->compute(2);
-
-    delete tree;
-    delete low_x;
-    delete high_x;
-    delete low_y;
-    delete high_y;
-    delete low_z;
-    delete high_z;
-
     fclose(fp);
-
   }
   
+  MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+  std::cout << "rank :" << rank << " n: " <<  n << std::endl;
+
+  if(rank != 0) {
+    plnts = new Planet[n];
+  } 
+
+  MPI_Bcast(plnts, n, planet_dtype, 0, MPI_COMM_WORLD);
+  
+  
+  int *counts_recv = new int[size];
+  int *displacements = new int[size];
+  int chunk_size = (n/size) + (n%size);
+
+  for(int i=0; i < size; i++) {
+    counts_recv[i] = chunk_size;
+    displacements[i] = chunk_size*i;
+  }
+  counts_recv[size-1] = n - chunk_size*(size-1);
+
+  
+  for(int i=0; i < 30; i++) {
+    double low_x =   10000000000;
+    double high_x = -10000000000;
+    double low_y = low_x;
+    double high_y = high_x;
+    double low_z = low_x;
+    double high_z = high_z;
+
+    for(int j = 0; j < n; j++) {
+      if(plnts[j].point.x > high_x) {
+        high_x = plnts[j].point.x;
+      }  
+      if(plnts[j].point.y > high_y) {
+        high_y = plnts[j].point.y;
+      }  
+      if(plnts[j].point.z > high_z) {
+        high_z = plnts[j].point.z;
+      }
+
+      if(plnts[j].point.x < low_x) {
+        low_x = plnts[j].point.x;
+      }
+      if(plnts[j].point.y < low_y) {
+        low_y = plnts[j].point.y;
+      }
+      if(plnts[j].point.z < low_z) {
+        low_z = plnts[j].point.z;
+      }
+    };
+
+    double mymin = std::min(std::min(low_x, low_y), low_z);
+    double mymax = std::max(std::max(high_x, high_y), high_z);
+    
+    Vec3f origin = vec3f( (high_x+low_x)/2, (high_y+low_y)/2, (high_z+low_z)/2);
+    
+    double max_bounds = (mymax-mymin)/2;
+    Vec3f bounds = vec3f(max_bounds, max_bounds, max_bounds);
+    
+    OctTree *tree = new OctTree(origin, bounds, rank, size);
+    for(int j=0; j < n; j++) {
+      tree->add_point(plnts[j]);
+    } 
+    auto newplnts = tree->compute();
+    std::cout << rank << " newpnts :" << newplnts.size() << std::endl;
+    delete tree;
+    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Allgatherv(newplnts.data(), counts_recv[rank], planet_dtype, plnts, counts_recv, displacements, planet_dtype, MPI_COMM_WORLD);
+  }
+  delete[] counts_recv;
+  delete[] displacements;
+  delete[] plnts;
   MPI_Type_free(&vec3f_dtype);
   MPI_Type_free(&planet_dtype);
   MPI_Finalize();
