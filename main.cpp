@@ -14,12 +14,15 @@
 #include <cmath>
 #include <queue>
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 
 #define PODVECTOR_START_SIZE 2
 #define PODVECTOR_GROWTH_FACTOR 2
 #define PODVECTOR_GROWTH_PADDING 8
 #define NUM_OCTANTS 8
 #define GRAVITY_CONSTANT 0.000000000066742
+#define EPSILON 0.000000000000000000001
 #define LEAPFROG_DELTA_T 0.01
 #define OCTANT_ppp 0
 #define OCTANT_npp 1
@@ -351,7 +354,7 @@ class OctTree {
 };
 
 OctTree::OctTree(Vec3f origin, Vec3f bounds, int rank, int size) {
-  this->theta = 1.5;
+  this->theta = 0.7;
   this->root = octnode(origin, bounds, 1, 0, nullptr);
   this->rank = rank;
   this->size = size;
@@ -388,35 +391,31 @@ double distance(Vec3f a, Vec3f b) {
 Vec3f OctTree::naiveforces(OctNode *node, Planet &planet) {
   Vec3f forces = vec3f(0,0,0);
 
-  std::queue<OctNode *> nodes;
-  nodes.push(node);
-  while(!nodes.empty()) {
-    OctNode *curr = nodes.front();
-    nodes.pop();
-    if(curr->internal) {
-      for(auto next: curr->children) {
-        if(next != nullptr) {
-          nodes.push(next);
-        }
-      }
+
+    // compute force exerted by planets in this octant
+  for(size_t i = 0; i < node->planets.size(); i++) {
+    if(node->planets[i].id == planet.id) {
       continue;
     }
 
-    // compute force exerted by planets in this octant
-    for(size_t i = 0; i < curr->planets.size(); i++) {
+    double mag3 = pow(distance(node->planets[i].point, planet.point), 3);
 
-      double mag3 = pow(distance(curr->planets[i].point, planet.point), 3);
-      double fx = GRAVITY_CONSTANT * (curr->planets[i].charge) * planet.charge * (curr->planets[i].point.x - planet.point.x);
-      forces.x = fx/mag3;
-
-      double fy = GRAVITY_CONSTANT * (curr->planets[i].charge) * planet.charge * (curr->planets[i].point.y - planet.point.y);
-      forces.y = fy/mag3;
-
-      double fz = GRAVITY_CONSTANT * (curr->planets[i].charge) * planet.charge * (curr->planets[i].point.z - planet.point.z);
-      forces.z = fz/mag3;
+    // prevent division by zero if planet in exact same spot
+    if(mag3 == 0.0) {
+      mag3 = EPSILON;
     }
 
+    double fx = GRAVITY_CONSTANT * (node->planets[i].charge) * planet.charge * (node->planets[i].point.x - planet.point.x);
+    forces.x = fx/mag3;
+
+    double fy = GRAVITY_CONSTANT * (node->planets[i].charge) * planet.charge * (node->planets[i].point.y - planet.point.y);
+    forces.y = fy/mag3;
+
+    double fz = GRAVITY_CONSTANT * (node->planets[i].charge) * planet.charge * (node->planets[i].point.z - planet.point.z);
+    forces.z = fz/mag3;
   }
+
+
   return forces;
 }
 
@@ -424,6 +423,13 @@ void OctTree::calcforces(OctNode *node, Planet &planet, Vec3f &forces) {
   
   for(auto child: node->children) {
     if(child != nullptr) {
+      if(!(child->internal)) {
+        Vec3f newforces = this->naiveforces(child, planet);
+        forces.x += newforces.x;
+        forces.y += newforces.y;
+        forces.z += newforces.z;
+        continue;
+      }
       double s = child->bounds.x*2; 
       double d = distance(planet.point, child->com);
       if(s/d < this->theta) {
@@ -435,10 +441,7 @@ void OctTree::calcforces(OctNode *node, Planet &planet, Vec3f &forces) {
         double fz = GRAVITY_CONSTANT * (child->charge) * planet.charge * (child->com.z - planet.point.z);
         forces.z = fz/mag3;
       }else {
-        Vec3f newforces = this->naiveforces(node, planet);
-        forces.x += newforces.x;
-        forces.y += newforces.y;
-        forces.z += newforces.z;
+        this->calcforces(child, planet, forces);
       }
     }
   } 
@@ -510,7 +513,9 @@ int main(int argc, char *argv[]) {
   MPI_Type_create_struct(planet_block_count, planet_lengths, planet_offsets, planet_internal_types, &planet_dtype);
   MPI_Type_commit(&planet_dtype);
 
-  
+  if(rank==0) {
+    std::cout << size << std::endl;
+  }  
   
   int n = 0;
   Planet *plnts;
@@ -549,7 +554,7 @@ int main(int argc, char *argv[]) {
   
   MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-  std::cout << "rank :" << rank << " n: " <<  n << std::endl;
+  // std::cout << "rank :" << rank << " n: " <<  n << std::endl;
 
   if(rank != 0) {
     plnts = new Planet[n];
@@ -567,7 +572,8 @@ int main(int argc, char *argv[]) {
     displacements[i] = chunk_size*i;
   }
   counts_recv[size-1] = n - chunk_size*(size-1);
-
+  
+  auto t1 = std::chrono::high_resolution_clock::now();
   
   for(int i=0; i < 30; i++) {
     double low_x =   10000000000;
@@ -575,7 +581,7 @@ int main(int argc, char *argv[]) {
     double low_y = low_x;
     double high_y = high_x;
     double low_z = low_x;
-    double high_z = high_z;
+    double high_z = high_x;
 
     for(int j = 0; j < n; j++) {
       if(plnts[j].point.x > high_x) {
@@ -606,17 +612,31 @@ int main(int argc, char *argv[]) {
     
     double max_bounds = (mymax-mymin)/2;
     Vec3f bounds = vec3f(max_bounds, max_bounds, max_bounds);
-    
+
     OctTree *tree = new OctTree(origin, bounds, rank, size);
     for(int j=0; j < n; j++) {
       tree->add_point(plnts[j]);
-    } 
+    }  
     auto newplnts = tree->compute();
-    std::cout << rank << " newpnts :" << newplnts.size() << std::endl;
     delete tree;
     MPI_Barrier(MPI_COMM_WORLD);
     MPI_Allgatherv(newplnts.data(), counts_recv[rank], planet_dtype, plnts, counts_recv, displacements, planet_dtype, MPI_COMM_WORLD);
   }
+  
+  auto t2 = std::chrono::high_resolution_clock::now();
+  
+  std::chrono::duration<double, std::milli> ms = t2-t1;
+
+  if(rank==0) {
+    std::cout << "DONE IN " << ms.count() << "ms\n";
+    for(int i=0; i<n; i++) {
+      Vec3f point = plnts[i].point;
+      Vec3f velocity = plnts[i].velocity;
+      double charge = plnts[i].charge;
+      printf("%lf %lf %lf %lf %lf %lf %lf\n", charge, point.x, point.y, point.z, velocity.x, velocity.y, velocity.z);
+    }
+  }
+
   delete[] counts_recv;
   delete[] displacements;
   delete[] plnts;
