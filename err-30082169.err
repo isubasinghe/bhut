@@ -1,0 +1,28 @@
+
+The following have been reloaded with a version change:
+  1) openmpi/3.1.6 => openmpi/3.1.4
+
+
+real	16m33.142s
+user	132m9.317s
+sys	0m3.164s
+
+real	8m20.831s
+user	66m29.714s
+sys	0m2.710s
+
+real	5m47.734s
+user	46m7.088s
+sys	0m1.939s
+
+real	4m19.639s
+user	34m22.964s
+sys	0m2.207s
+
+real	3m34.701s
+user	28m20.309s
+sys	0m1.655s
+
+real	2m22.153s
+user	18m40.782s
+sys	0m2.038s
