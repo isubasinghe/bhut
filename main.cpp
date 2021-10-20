@@ -10,7 +10,6 @@
 #include <cstddef>
 #include <sys/mman.h>
 #include <mpi.h>
-#include <omp.h>
 #include <cmath>
 #include <queue>
 #include <algorithm>
@@ -62,7 +61,7 @@ std::ostream &operator<<(std::ostream &os, Vec3f const &m) {
 static_assert(std::is_pod<Vec3f>::value, "Must be a POD type");
 
 Vec3f vec3f(double x, double y, double z) {
-  Vec3f v{};
+  Vec3f v;
   v.x = x;
   v.y = y;
   v.z = z;
@@ -105,7 +104,7 @@ class PODVector {
 
 template <typename T>
 PODVector<T> podvector() {
-  PODVector<T> p{};
+  PODVector<T> p;
   p._internal_data = new T[PODVECTOR_START_SIZE];
   p._internal_cap = PODVECTOR_START_SIZE;
   p._internal_num = 0;
@@ -171,7 +170,7 @@ void PODVector<T>::free() {
   delete[] this->_internal_data;
 }
 
-static_assert(std::is_pod<PODVector<int>>::value, "Seems like PODVector is not POD itself");
+// static_assert(std::is_pod<PODVector<int>>::value, "Seems like PODVector is not POD itself");
 
 class Planet {
   public:
@@ -181,26 +180,26 @@ class Planet {
     int id;
 };
 
-std::ostream &operator<<(std::ostream &os, Planet const &m) {
+/* std::ostream &operator<<(std::ostream &os, Planet const &m) {
   return os << "PLANET POINT :" << m.point << "\t VEL: " << m.velocity << " CHARGE :" << m.charge;
-}
+} */
 
 
 Planet planet(Vec3f point, double charge) {
-  Planet p{};
+  Planet p;
   p.point = point;
   p.charge = charge;
   return p;
 }
 
 Planet planet(double x, double y, double z, double charge) {
-  Planet p{};
+  Planet p;
   p.point = vec3f(x,y,z);
   p.charge = charge;
   return p;
 }
 
-static_assert(std::is_pod<Planet>::value, "Planet should be of a POD type");
+// static_assert(std::is_pod<Planet>::value, "Planet should be of a POD type");
 
 
 // depth of OctNode is limited by morton id
@@ -224,7 +223,7 @@ class OctNode {
     void free();
 };
 
-static_assert(std::is_pod<OctNode>::value, "OctNode must be a POD");
+// static_assert(std::is_pod<OctNode>::value, "OctNode must be a POD");
 
 OctNode *octnode(Vec3f origin, Vec3f bounds, unsigned int depth, unsigned long long mortonid, OctNode *parent) {
   auto *node = new OctNode;
@@ -465,7 +464,7 @@ std::vector<Planet> OctTree::compute() {
       calcforces(this->root, p, forces);
       Vec3f acceleration = vec3f(forces.x/ p.charge, forces.y/p.charge, forces.z/p.charge);
 
-      Planet newplanet{};
+      Planet newplanet;
       newplanet.velocity = vec3f(p.velocity.x + (acceleration.x*LEAPFROG_DELTA_T)/leapdiv,
                                  p.velocity.y + (acceleration.y*LEAPFROG_DELTA_T)/leapdiv,
                                  p.velocity.z + (acceleration.z*LEAPFROG_DELTA_T)/leapdiv);
@@ -518,7 +517,7 @@ int main(int argc, char *argv[]) {
   }  
   
   int n = 0;
-  Planet *plnts;
+  Planet *plnts = nullptr;
 
   if(rank==0) {
     
@@ -536,7 +535,7 @@ int main(int argc, char *argv[]) {
       if(ret != 7) {
         break;
       }
-      Planet p{};
+      Planet p;
       p.charge = mass;
       p.point = vec3f(x,y,z);
       p.velocity = vec3f(vx, vy, vz);
@@ -556,7 +555,7 @@ int main(int argc, char *argv[]) {
 
   // std::cout << "rank :" << rank << " n: " <<  n << std::endl;
 
-  if(rank != 0) {
+  if(plnts == nullptr) {
     plnts = new Planet[n];
   } 
 
@@ -618,9 +617,9 @@ int main(int argc, char *argv[]) {
       tree->add_point(plnts[j]);
     }  
     auto newplnts = tree->compute();
-    delete tree;
     MPI_Barrier(MPI_COMM_WORLD);
     MPI_Allgatherv(newplnts.data(), counts_recv[rank], planet_dtype, plnts, counts_recv, displacements, planet_dtype, MPI_COMM_WORLD);
+    delete tree;
   }
   
   auto t2 = std::chrono::high_resolution_clock::now();
