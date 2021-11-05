@@ -1,3 +1,9 @@
+// COMPILE WITH: mpicxx isithasubasinghe_main.cpp -o bhut -static-libstdc++ -O3 -fno-exceptions -march=native -fno-rtti -funroll-loops -pedantic -Wall
+// RUN WITH: time mpirun ./bhut 
+//
+// SLURM
+// Can be run anywhere, no real restrictions here
+// 4GB per process is enough, even this is too much tbh
 #include <iostream>
 #include <set>
 #include <map>
@@ -572,7 +578,6 @@ int main(int argc, char *argv[]) {
   }
   counts_recv[size-1] = n - chunk_size*(size-1);
   
-  auto t1 = std::chrono::high_resolution_clock::now();
   
   for(int i=0; i < 30; i++) {
     double low_x =   10000000000;
@@ -621,21 +626,15 @@ int main(int argc, char *argv[]) {
     MPI_Allgatherv(newplnts.data(), counts_recv[rank], planet_dtype, plnts, counts_recv, displacements, planet_dtype, MPI_COMM_WORLD);
     delete tree;
   }
-  
-  auto t2 = std::chrono::high_resolution_clock::now();
-  
-  std::chrono::duration<double, std::milli> ms = t2-t1;
 
   if(rank==0) {
-    std::cout << "DONE IN " << ms.count() << "ms\n";
     /* for(int i=0; i<n; i++) {
       Vec3f point = plnts[i].point;
       Vec3f velocity = plnts[i].velocity;
       double charge = plnts[i].charge;
       printf("%lf %lf %lf %lf %lf %lf %lf\n", charge, point.x, point.y, point.z, velocity.x, velocity.y, velocity.z);
     } */
-  }
-
+  }  
   delete[] counts_recv;
   delete[] displacements;
   delete[] plnts;
