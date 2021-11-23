@@ -19,5 +19,9 @@ of what would happen, to get a more accurate solution, simulation of general rel
 I do not use Runge-Kutta! Yup, I use something called leapfrog integration which keeps a bound on the error. 
 This is critical since we need to conserve momentumn (because you know Physics be like that), something Runge-Kutta cannot do.
 
+## Grade 
+20/20 
+
+
 
 
