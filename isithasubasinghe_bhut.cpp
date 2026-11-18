@@ -26,7 +26,7 @@
 #define PODVECTOR_GROWTH_FACTOR 2
 #define PODVECTOR_GROWTH_PADDING 8
 #define NUM_OCTANTS 8
-#define GRAVITY_CONSTANT 0.000000000066742
+#define GRAVITY_CONSTANT 1.0 // planets.txt is in N-body units (G = 1), not SI
 #define EPSILON 0.000000000000000000001
 #define LEAPFROG_DELTA_T 0.01
 #define OCTANT_ppp 0
@@ -490,6 +490,25 @@ std::vector<Planet> OctTree::compute() {
   return newplanets;
 }
 
+#define NUM_STEPS 30
+#define OUTPUT_FILE "simulation.bin"
+
+// Layout of OUTPUT_FILE (binary, native byte order):
+//   int32   n                  number of planets
+//   int32   frames             number of frames (NUM_STEPS + 1, frame 0 is the input)
+//   double  mass[n]            index = planet id
+//   double  pos[frames][n][3]  x, y, z, index = planet id
+// plnts is not in id order after MPI_Allgatherv, so each frame is put in id order here.
+void write_frame(FILE *fp, Planet *plnts, int n, std::vector<double> &buf) {
+  for(int j = 0; j < n; j++) {
+    int id = plnts[j].id;
+    buf[3*id] = plnts[j].point.x;
+    buf[3*id + 1] = plnts[j].point.y;
+    buf[3*id + 2] = plnts[j].point.z;
+  }
+  fwrite(buf.data(), sizeof(double), buf.size(), fp);
+}
+
 double randf(double min, double max) {
   return ((double(rand()) / double(RAND_MAX)) * (max - min)) + min;
 }
@@ -585,7 +604,26 @@ int main(int argc, char *argv[]) {
   }
   
   
-  for(int i=0; i < 30; i++) {
+  FILE *out = nullptr;
+  std::vector<double> frame;
+  if(rank==0) {
+    out = fopen(OUTPUT_FILE, "wb");
+    if(out == nullptr) {
+      std::cerr << "Unable to open " << OUTPUT_FILE << std::endl;
+      MPI_Abort(MPI_COMM_WORLD, 1);
+      return 1;
+    }
+    int header[2] = {n, NUM_STEPS + 1};
+    fwrite(header, sizeof(int), 2, out);
+    // plnts is in id order here, before the first MPI_Allgatherv
+    for(int j = 0; j < n; j++) {
+      fwrite(&plnts[j].charge, sizeof(double), 1, out);
+    }
+    frame.resize(3 * (size_t)n);
+    write_frame(out, plnts, n, frame);
+  }
+
+  for(int i=0; i < NUM_STEPS; i++) {
     double low_x =   10000000000;
     double high_x = -10000000000;
     double low_y = low_x;
@@ -631,9 +669,13 @@ int main(int argc, char *argv[]) {
     MPI_Barrier(MPI_COMM_WORLD);
     MPI_Allgatherv(newplnts.data(), counts_recv[rank], planet_dtype, plnts, counts_recv, displacements, planet_dtype, MPI_COMM_WORLD);
     delete tree;
+    if(rank==0) {
+      write_frame(out, plnts, n, frame);
+    }
   }
 
   if(rank==0) {
+    fclose(out);
     /* for(int i=0; i<n; i++) {
       Vec3f point = plnts[i].point;
       Vec3f velocity = plnts[i].velocity;
