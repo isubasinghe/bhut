@@ -411,13 +411,13 @@ Vec3f OctTree::naiveforces(OctNode *node, Planet &planet) {
     }
 
     double fx = GRAVITY_CONSTANT * (node->planets[i].charge) * planet.charge * (node->planets[i].point.x - planet.point.x);
-    forces.x = fx/mag3;
+    forces.x += fx/mag3;
 
     double fy = GRAVITY_CONSTANT * (node->planets[i].charge) * planet.charge * (node->planets[i].point.y - planet.point.y);
-    forces.y = fy/mag3;
+    forces.y += fy/mag3;
 
     double fz = GRAVITY_CONSTANT * (node->planets[i].charge) * planet.charge * (node->planets[i].point.z - planet.point.z);
-    forces.z = fz/mag3;
+    forces.z += fz/mag3;
   }
 
 
@@ -440,11 +440,11 @@ void OctTree::calcforces(OctNode *node, Planet &planet, Vec3f &forces) {
       if(s/d < this->theta) {
         double mag3 = pow(distance(child->com, planet.point), 3); 
         double fx = GRAVITY_CONSTANT * (child->charge) * planet.charge * (child->com.x - planet.point.x);
-        forces.x = fx/mag3;
+        forces.x += fx/mag3;
         double fy = GRAVITY_CONSTANT * (child->charge) * planet.charge * (child->com.y - planet.point.y);
-        forces.y = fy/mag3;
+        forces.y += fy/mag3;
         double fz = GRAVITY_CONSTANT * (child->charge) * planet.charge * (child->com.z - planet.point.z);
-        forces.z = fz/mag3;
+        forces.z += fz/mag3;
       }else {
         this->calcforces(child, planet, forces);
       }
@@ -454,9 +454,12 @@ void OctTree::calcforces(OctNode *node, Planet &planet, Vec3f &forces) {
 
 std::vector<Planet> OctTree::compute() {
   std::vector<Planet> newplanets;
-  int chunk_size = this->planets/this->size + (this->planets % this->size);
-  int low_range = this->rank*chunk_size;
-  int high_range = (this->rank+1)*chunk_size;
+  // Must agree with counts_recv and displacements in main:
+  // each rank gets n/size planets, and the first n%size ranks get one more.
+  int base = this->planets/this->size;
+  int extra = this->planets % this->size;
+  int low_range = this->rank*base + std::min(this->rank, extra);
+  int high_range = low_range + base + (this->rank < extra ? 1 : 0);
   
   for(auto node: this->leafs) {
     for(size_t i = 0; i < node->planets.size(); i++) {
@@ -530,6 +533,8 @@ int main(int argc, char *argv[]) {
     FILE *fp = fopen("planets.txt", "rb");
     if(fp == nullptr) {
       std::cerr << "Unable to open file" << std::endl;
+      // A plain return leaves the other ranks blocked in MPI_Bcast.
+      MPI_Abort(MPI_COMM_WORLD, 1);
       return 1;
     }
     
@@ -570,13 +575,14 @@ int main(int argc, char *argv[]) {
   
   int *counts_recv = new int[size];
   int *displacements = new int[size];
-  int chunk_size = (n/size) + (n%size);
+  // Each rank gets n/size planets, and the first n%size ranks get one more.
+  int base = n/size;
+  int extra = n%size;
 
   for(int i=0; i < size; i++) {
-    counts_recv[i] = chunk_size;
-    displacements[i] = chunk_size*i;
+    counts_recv[i] = base + (i < extra ? 1 : 0);
+    displacements[i] = i*base + std::min(i, extra);
   }
-  counts_recv[size-1] = n - chunk_size*(size-1);
   
   
   for(int i=0; i < 30; i++) {
