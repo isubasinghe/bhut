@@ -490,7 +490,7 @@ std::vector<Planet> OctTree::compute() {
   return newplanets;
 }
 
-#define NUM_STEPS 30
+#define NUM_STEPS 3000
 #define OUTPUT_FILE "simulation.bin"
 
 // Layout of OUTPUT_FILE (binary, native byte order):

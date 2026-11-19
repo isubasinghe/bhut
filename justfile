@@ -2,9 +2,9 @@
 # Or without the shell: `nix develop -c just`.
 
 # Number of MPI processes
-np := "8"
+np := "12"
 # Frames for each second of video
-fps := "10"
+fps := "30"
 
 bin := "build/bhut"
 
