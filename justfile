@@ -5,6 +5,9 @@
 np := "12"
 # Frames for each second of video
 fps := "30"
+# Smaller defaults for a GIF embedded in the README
+gif_fps := "10"
+gif_width := "640"
 
 bin := "build/bhut"
 
@@ -24,6 +27,12 @@ simulate: build
 video:
     python3 make_video.py simulation.bin -o simulation.mp4 --fps {{fps}}
 
+# Make a looping simulation.gif from simulation.mp4 (run `just video` first)
+gif:
+    ffmpeg -hide_banner -loglevel warning -y -i simulation.mp4 \
+        -filter_complex "fps={{gif_fps}},scale={{gif_width}}:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=bayer:bayer_scale=5" \
+        -an -loop 0 simulation.gif
+
 # Delete the compiled program and the outputs
 clean:
-    rm -rf build simulation.bin simulation.mp4
+    rm -rf build simulation.bin simulation.mp4 simulation.gif

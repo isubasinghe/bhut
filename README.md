@@ -1,4 +1,7 @@
 # A Distributed-Memory simulation of the Andromeda-Milky Way collision.
+
+![Andromeda–Milky Way collision simulation](simulation.gif)
+
 ## What is this?
 The Andromeda and Milky Way galaxies will collide in approximately 5 billion years, forming Milkdromeda or the Andromeda-Milky Way galaxy. 
 This is a distributed memory simulation of this collision run on the ''Supercomputer''/HPC system at the University of Melbourne done as part of coursework for Masters. 
@@ -39,6 +42,18 @@ frames. Density mode expands the view along the longer output dimension to
 preserve proportions. Use `--fraction 0.99` to include more outskirts, or adjust the camera
 with `--elev 25 --azim 45` (angles in degrees). Rendering requires NumPy,
 Matplotlib, and FFmpeg, all included in the Nix shell.
+
+## Render a GIF
+After `just video`, run `just gif` inside `nix develop` to convert
+`simulation.mp4` into a looping `simulation.gif`. The GIF keeps the full video
+duration and aspect ratio, at 640 pixels wide and 10 frames per second.
+For a smaller file, use `just --set gif_width 480 --set gif_fps 8 gif`.
+
+Commit `simulation.gif` alongside the README to embed it with:
+
+```markdown
+![Andromeda–Milky Way collision simulation](simulation.gif)
+```
 
 ## Caveats
 Well I do not simulate general relativity, this is pretty simple Newtonian physics, which is mostly fine
