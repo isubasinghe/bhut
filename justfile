@@ -8,6 +8,7 @@ fps := "30"
 # Smaller defaults for a GIF embedded in the README
 gif_fps := "10"
 gif_width := "640"
+simulation := "simulation.bin"
 
 bin := "build/bhut"
 
@@ -23,13 +24,26 @@ build:
 simulate: build
     mpirun -np {{np}} {{bin}}
 
+# CUDA build: enter `nix develop .#cuda`, or provide nvcc on PATH.
+build-gpu:
+    mkdir -p build
+    nvcc -O3 -std=c++17 -arch=sm_75 -lineinfo -Xcompiler=-Wall,-Wextra bhut_gpu.cu -o build/bhut-gpu
+
+# Creates simulation-gpu.bin; existing simulation output is never overwritten.
+simulate-gpu: build-gpu
+    build/bhut-gpu --validate 256
+
+# GPU topology, force, integration, file-format, and CLI regression checks.
+test-gpu: build-gpu
+    python3 tests/test_gpu.py build/bhut-gpu
+
 # Make simulation.mp4 from simulation.bin
 video:
     cargo run --release -- simulation.bin -o simulation.mp4 --fps {{fps}}
 
 # Render density with Vulkan and encode H.265 with the NVIDIA GPU
 video-gpu:
-    cargo run --release -- simulation.bin -o simulation.mp4 --fps {{fps}} --renderer gpu --encoder nvenc
+    cargo run --release -- {{simulation}} -o simulation.mp4 --fps {{fps}} --renderer gpu --encoder nvenc
 
 # Use the original Python/Matplotlib renderer
 video-python:
