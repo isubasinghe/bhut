@@ -1,7 +1,9 @@
 //! Render the simulator's native-endian binary output, streaming RGB to FFmpeg.
 //! The original Matplotlib renderer is make_video.py.
+mod brightness;
 mod camera_cache;
 mod frame_io;
+mod gpu_density;
 use camera_cache::CameraCache;
 use frame_io::{Backend, FrameReader};
 use rayon::prelude::*;
@@ -36,6 +38,8 @@ Usage: make_video [simulation.bin] [options]
   --io-backend NAME         auto, uring (Linux), or threaded (default: auto)
   --render-threads INTEGER  Density workers (0 = automatic, default: 0)
   --no-camera-cache         Recompute bounds without reading/writing the sidecar
+  --renderer NAME          cpu or gpu (Vulkan compute; default: cpu)
+  --brightness MODE        fast lookup or exact math (default: fast)
   -h, --help                Show this help";
 
 struct Options {
@@ -57,6 +61,8 @@ struct Options {
     cq: u8,
     render_threads: usize,
     camera_cache: bool,
+    gpu: bool,
+    fast_brightness: bool,
 }
 
 impl Options {
@@ -80,6 +86,8 @@ impl Options {
             cq: 18,
             render_threads: 0,
             camera_cache: true,
+            gpu: false,
+            fast_brightness: true,
         };
         let mut args = args.into_iter();
         let mut positional = false;
@@ -121,6 +129,8 @@ impl Options {
                     | "--encoder"
                     | "--cq"
                     | "--render-threads"
+                    | "--renderer"
+                    | "--brightness"
             ) {
                 return Err(format!("unknown option: {key}").into());
             }
@@ -134,6 +144,20 @@ impl Options {
                 "--width" => options.width = value.parse()?,
                 "--height" => options.height = value.parse()?,
                 "--render-threads" => options.render_threads = value.parse()?,
+                "--renderer" => {
+                    options.gpu = match value.as_str() {
+                        "cpu" => false,
+                        "gpu" => true,
+                        _ => return Err("renderer must be cpu or gpu".into()),
+                    }
+                }
+                "--brightness" => {
+                    options.fast_brightness = match value.as_str() {
+                        "fast" => true,
+                        "exact" => false,
+                        _ => return Err("brightness must be fast or exact".into()),
+                    }
+                }
                 "--render-mode" => {
                     options.particles = match value.as_str() {
                         "particles" => true,
@@ -205,6 +229,9 @@ impl Options {
         }
         if options.crf > 51 {
             return Err("CRF must be in 0–51".into());
+        }
+        if options.gpu && options.particles {
+            return Err("GPU rendering currently requires --render-mode density".into());
         }
         if options.nvenc {
             if !preset_given {
@@ -586,11 +613,48 @@ fn cached_fixed_view(
     Ok(bounds)
 }
 
-fn blur(layer: &mut [f32], scratch: &mut [f32], width: usize, height: usize) {
+fn gaussian_kernel() -> [f32; 9] {
     let mut kernel: [f32; 9] =
         std::array::from_fn(|i| (-0.5 * ((i as f32 - 4.0) / 1.4).powi(2)).exp());
     let sum: f32 = kernel.iter().sum();
     kernel.iter_mut().for_each(|v| *v /= sum);
+    kernel
+}
+
+const TILE: usize = 32;
+fn active_ranges(mask: Option<&[u8]>, width: usize, mut visit: impl FnMut(usize, usize)) {
+    let Some(mask) = mask else {
+        visit(0, width);
+        return;
+    };
+    let mut tile = 0;
+    while tile < mask.len() {
+        if mask[tile] == 0 {
+            tile += 1;
+            continue;
+        }
+        let start = tile;
+        while tile < mask.len() && mask[tile] != 0 {
+            tile += 1;
+        }
+        visit(start * TILE, (tile * TILE).min(width));
+    }
+}
+
+#[cfg(test)]
+fn blur(layer: &mut [f32], scratch: &mut [f32], width: usize, height: usize) {
+    blur_tiles(layer, scratch, width, height, None);
+}
+
+fn blur_tiles(
+    layer: &mut [f32],
+    scratch: &mut [f32],
+    width: usize,
+    height: usize,
+    masks: Option<(&[u8], &[u8])>,
+) {
+    let kernel = gaussian_kernel();
+    let cols = width.div_ceil(TILE);
     // Finish each row while it is in cache instead of scanning the whole 4K
     // image nine times. Keep the accumulation order and zero padding unchanged.
     scratch
@@ -599,16 +663,21 @@ fn blur(layer: &mut [f32], scratch: &mut [f32], width: usize, height: usize) {
         .with_min_len(16)
         .for_each(|(y, out)| {
             out.fill(0.0);
-            for (k, &weight) in kernel.iter().enumerate() {
-                let source = y as isize + k as isize - 4;
-                if source < 0 || source >= height as isize {
-                    continue;
+            let mask =
+                masks.map(|(vertical, _)| &vertical[(y / TILE) * cols..(y / TILE + 1) * cols]);
+            active_ranges(mask, width, |start, end| {
+                for (k, &weight) in kernel.iter().enumerate() {
+                    let source = y as isize + k as isize - 4;
+                    if source < 0 || source >= height as isize {
+                        continue;
+                    }
+                    let row =
+                        &layer[source as usize * width + start..source as usize * width + end];
+                    for (out, &value) in out[start..end].iter_mut().zip(row) {
+                        *out += weight * value;
+                    }
                 }
-                let row = &layer[source as usize * width..(source as usize + 1) * width];
-                for (out, &value) in out.iter_mut().zip(row) {
-                    *out += weight * value;
-                }
-            }
+            });
         });
     layer
         .par_chunks_exact_mut(width)
@@ -616,31 +685,42 @@ fn blur(layer: &mut [f32], scratch: &mut [f32], width: usize, height: usize) {
         .with_min_len(16)
         .for_each(|(y, out)| {
             out.fill(0.0);
-            for (k, &weight) in kernel.iter().enumerate() {
-                let shift = k as isize - 4;
-                let start = (-shift).max(0) as usize;
-                let end = (width as isize - shift).min(width as isize).max(0) as usize;
-                if start >= end {
-                    continue;
+            let mask =
+                masks.map(|(_, final_mask)| &final_mask[(y / TILE) * cols..(y / TILE + 1) * cols]);
+            active_ranges(mask, width, |x0, x1| {
+                for (k, &weight) in kernel.iter().enumerate() {
+                    let shift = k as isize - 4;
+                    let start = ((-shift).max(0) as usize).max(x0);
+                    let end =
+                        ((width as isize - shift).min(width as isize).max(0) as usize).min(x1);
+                    if start >= end {
+                        continue;
+                    }
+                    let source = (y * width + start) as isize + shift;
+                    let input = &scratch[source as usize..source as usize + end - start];
+                    for (out, &value) in out[start..end].iter_mut().zip(input) {
+                        *out += weight * value;
+                    }
                 }
-                let source = (y * width + start) as isize + shift;
-                let input = &scratch[source as usize..source as usize + end - start];
-                for (out, &value) in out[start..end].iter_mut().zip(input) {
-                    *out += weight * value;
-                }
-            }
+            });
         });
 }
 
 struct Density {
     layers: [Vec<f32>; 2],
     scratch: Vec<f32>,
+    vertical: [Vec<u8>; 2],
+    active: [Vec<u8>; 2],
+    combined: Vec<u8>,
 }
 impl Density {
     fn new(size: usize) -> Self {
         Self {
             layers: [vec![0.0; size], vec![0.0; size]],
             scratch: vec![0.0; size],
+            vertical: [Vec::new(), Vec::new()],
+            active: [Vec::new(), Vec::new()],
+            combined: Vec::new(),
         }
     }
     fn render(
@@ -653,6 +733,12 @@ impl Density {
     ) {
         let (w, h) = (opts.width, opts.height);
         let scale = w.min(h) as f64 / (2.0 * half);
+        let cols = w.div_ceil(TILE);
+        let tiles = cols * h.div_ceil(TILE);
+        for mask in self.vertical.iter_mut().chain(self.active.iter_mut()) {
+            mask.resize(tiles, 0);
+            mask.fill(0);
+        }
         self.layers.iter_mut().for_each(|layer| layer.fill(0.0));
         for (p, &group) in points.iter().zip(groups) {
             let x = (p[0] - centre[0]) * scale + w as f64 / 2.0;
@@ -661,10 +747,27 @@ impl Density {
                 // As in histogram2d, include the upper bound in the last bin.
                 let (x, y) = ((x as usize).min(w - 1), (y as usize).min(h - 1));
                 self.layers[group][y * w + x] += 1.0;
+                // Only tiles touched by the exact four-pixel kernel halo are active.
+                for ty in y.saturating_sub(4) / TILE..=(y + 4).min(h - 1) / TILE {
+                    self.vertical[group][ty * cols + x / TILE] = 1;
+                    for tx in x.saturating_sub(4) / TILE..=(x + 4).min(w - 1) / TILE {
+                        self.active[group][ty * cols + tx] = 1;
+                    }
+                }
             }
         }
-        for layer in &mut self.layers {
-            blur(layer, &mut self.scratch, w, h);
+        for group in 0..2 {
+            blur_tiles(
+                &mut self.layers[group],
+                &mut self.scratch,
+                w,
+                h,
+                Some((&self.vertical[group], &self.active[group])),
+            );
+        }
+        self.combined.resize(tiles, 0);
+        for (i, value) in self.combined.iter_mut().enumerate() {
+            *value = self.active[0][i] | self.active[1][i];
         }
     }
     fn exposure(&self) -> f32 {
@@ -674,29 +777,40 @@ impl Density {
             .map(|(a, b)| a + b)
             .fold(1.0, f32::max)
     }
-    fn rgb(&self, pixels: &mut [u8], width: usize, height: usize, exposure: f32) {
-        let denominator = (10.0 * exposure).ln_1p();
+    fn rgb(&self, pixels: &mut [u8], width: usize, height: usize, exposure: f32, fast: bool) {
+        let curve = brightness::Brightness::new(exposure, fast);
+        let cols = width.div_ceil(TILE);
         pixels
             .par_chunks_exact_mut(width * 3)
             .enumerate()
             .with_min_len(16)
             .for_each(|(screen_y, row)| {
                 let y = height - 1 - screen_y;
-                for (x, pixel) in row.chunks_exact_mut(3).enumerate() {
-                    let a = self.layers[0][y * width + x];
-                    let b = self.layers[1][y * width + x];
-                    let total = a + b;
-                    if total == 0.0 {
-                        pixel.fill(0);
-                        continue;
-                    }
-                    let brightness = ((10.0 * total).ln_1p() / denominator).min(1.0).powf(0.6);
-                    for c in 0..3 {
-                        pixel[c] = (255.0 * (a * COLOURS[0][c] + b * COLOURS[1][c])
-                            / total.max(1e-12)
-                            * brightness) as u8;
-                    }
-                }
+                row.fill(0);
+                active_ranges(
+                    Some(&self.combined[(y / TILE) * cols..(y / TILE + 1) * cols]),
+                    width,
+                    |start, end| {
+                        for (local_x, pixel) in
+                            row[start * 3..end * 3].chunks_exact_mut(3).enumerate()
+                        {
+                            let x = start + local_x;
+                            let a = self.layers[0][y * width + x];
+                            let b = self.layers[1][y * width + x];
+                            let total = a + b;
+                            if total == 0.0 {
+                                pixel.fill(0);
+                                continue;
+                            }
+                            let brightness = curve.value(total);
+                            for c in 0..3 {
+                                pixel[c] = (255.0 * (a * COLOURS[0][c] + b * COLOURS[1][c])
+                                    / total.max(1e-12)
+                                    * brightness) as u8;
+                            }
+                        }
+                    },
+                );
             });
     }
 }
@@ -786,6 +900,7 @@ fn write_frames(
     Ok(())
 }
 
+#[cfg(test)]
 fn render_pipeline(
     input: FrameReader,
     output: impl Write + Send,
@@ -796,9 +911,30 @@ fn render_pipeline(
     half: f64,
     opts: &Options,
 ) -> Result<()> {
+    let gpu = if opts.gpu {
+        Some(gpu_density::GpuDensity::new(opts, groups.len())?)
+    } else {
+        None
+    };
+    render_pipeline_with_gpu(
+        input, output, projection, groups, frames, centre, half, opts, gpu,
+    )
+}
+
+fn render_pipeline_with_gpu(
+    input: FrameReader,
+    output: impl Write + Send,
+    projection: &Projection,
+    groups: &[usize],
+    frames: usize,
+    centre: [f64; 2],
+    half: f64,
+    opts: &Options,
+    mut gpu: Option<gpu_density::GpuDensity>,
+) -> Result<()> {
     // Two reusable buffers at each boundary bound memory and apply backpressure.
     // Reading/projecting and writing to FFmpeg happen independently of rendering.
-    let pool = if opts.particles {
+    let pool = if opts.particles || opts.gpu {
         None
     } else {
         let workers = if opts.render_threads == 0 {
@@ -825,7 +961,7 @@ fn render_pipeline(
         let reader = scope.spawn(|| read_ahead(input, projection, frames, input_tx, input_free_rx));
         let writer = scope.spawn(|| write_frames(output, output_rx, output_free_tx));
         let rendering = (|| -> Result<()> {
-            let mut density = if opts.particles {
+            let mut density = if opts.particles || opts.gpu {
                 None
             } else {
                 Some(Density::new(opts.width * opts.height))
@@ -836,13 +972,28 @@ fn render_pipeline(
                 let mut pixels = output_free_rx
                     .recv()
                     .map_err(|_| "encoder writer stopped")?;
-                if let Some(density) = &mut density {
+                if let Some(gpu) = &mut gpu {
+                    gpu.render(
+                        &points,
+                        groups,
+                        centre,
+                        half,
+                        &mut pixels,
+                        opts.fast_brightness,
+                    )?;
+                } else if let Some(density) = &mut density {
                     pool.as_ref().unwrap().install(|| {
                         density.render(&points, groups, centre, half, opts);
                         if frame == 0 {
                             exposure = density.exposure();
                         }
-                        density.rgb(&mut pixels, opts.width, opts.height, exposure);
+                        density.rgb(
+                            &mut pixels,
+                            opts.width,
+                            opts.height,
+                            exposure,
+                            opts.fast_brightness,
+                        );
                     });
                 } else {
                     particles(&mut pixels, &points, groups, centre, half, opts);
@@ -878,6 +1029,7 @@ fn encode(
     centre: [f64; 2],
     half: f64,
     opts: &Options,
+    gpu: Option<gpu_density::GpuDensity>,
 ) -> Result<()> {
     let caption = if opts.particles {
         "Individual particles · fixed camera"
@@ -929,8 +1081,8 @@ fn encode(
         .map_err(|e| format!("could not start FFmpeg (enter nix develop): {e}"))?;
     let pipe = child.stdin.take().expect("piped FFmpeg stdin");
     let started = Instant::now();
-    let result = render_pipeline(
-        input, pipe, projection, groups, sim.frames, centre, half, opts,
+    let result = render_pipeline_with_gpu(
+        input, pipe, projection, groups, sim.frames, centre, half, opts, gpu,
     );
     let status = child.wait()?;
     result?;
@@ -958,6 +1110,11 @@ fn run() -> Result<()> {
     }
     let mut sim = Simulation::open(&opts.input)?;
     check_gpu_encoder(&opts)?;
+    let gpu = if opts.gpu {
+        Some(gpu_density::GpuDensity::new(&opts, sim.n)?)
+    } else {
+        None
+    };
     sim.rewind()?;
     let groups = initial_groups(sim.read_frame()?);
     let projection = Projection::new(opts.elev, opts.azim);
@@ -972,7 +1129,7 @@ fn run() -> Result<()> {
         sim.n - orange,
         orange
     );
-    encode(&mut sim, &projection, &groups, centre, half, &opts)?;
+    encode(&mut sim, &projection, &groups, centre, half, &opts, gpu)?;
     println!("wrote {}", opts.output);
     Ok(())
 }
@@ -1050,13 +1207,110 @@ mod tests {
                 let mut density = Density::new(opts.width * opts.height);
                 density.render(&points, &groups, [0.0; 2], 1.0, &opts);
                 let mut pixels = vec![0; opts.width * opts.height * 3];
-                density.rgb(&mut pixels, opts.width, opts.height, density.exposure());
+                density.rgb(
+                    &mut pixels,
+                    opts.width,
+                    opts.height,
+                    density.exposure(),
+                    opts.fast_brightness,
+                );
                 (density.layers, pixels)
             }))
         };
         let serial = render(1)?;
         for workers in [2, 4, 8] {
             assert_eq!(render(workers)?, serial);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_tiles_match_dense_blur_at_boundaries_and_clear_old_frames() -> Result<()> {
+        let opts = Options::parse(["--width", "70", "--height", "66"].map(str::to_owned))?.unwrap();
+        let mut density = Density::new(70 * 66);
+        let mut reference = [vec![0.0; 70 * 66], vec![0.0; 70 * 66]];
+        let bins = [
+            (0, 0),
+            (31, 31),
+            (32, 32),
+            (35, 35),
+            (63, 63),
+            (64, 64),
+            (69, 65),
+        ];
+        let groups: Vec<_> = (0..bins.len()).map(|i| i % 2).collect();
+        let points: Vec<_> = bins
+            .iter()
+            .map(|&(x, y)| {
+                [
+                    (x as f64 + 0.5 - 35.0) / 33.0,
+                    (y as f64 + 0.5 - 33.0) / 33.0,
+                ]
+            })
+            .collect();
+        for ((x, y), group) in bins.into_iter().zip(&groups) {
+            reference[*group][y * 70 + x] += 1.0;
+        }
+        for layer in &mut reference {
+            blur(layer, &mut vec![0.0; 70 * 66], 70, 66);
+        }
+        density.render(&points, &groups, [0.0; 2], 1.0, &opts);
+        assert_eq!(density.layers, reference);
+        let mut exact = vec![0; 70 * 66 * 3];
+        let mut fast = exact.clone();
+        density.rgb(&mut exact, 70, 66, density.exposure(), false);
+        density.rgb(&mut fast, 70, 66, density.exposure(), true);
+        assert!(exact.iter().zip(&fast).all(|(&a, &b)| a.abs_diff(b) <= 1));
+        density.render(&[], &[], [0.0; 2], 1.0, &opts);
+        density.rgb(&mut fast, 70, 66, 1.0, true);
+        assert!(density.layers.iter().flatten().all(|&v| v == 0.0));
+        assert!(fast.iter().all(|&v| v == 0));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU; run explicitly outside GPU-restricted sandboxes"]
+    fn gpu_density_matches_cpu() -> Result<()> {
+        let opts = Options::parse(
+            ["--width", "258", "--height", "130", "--renderer", "gpu"].map(str::to_owned),
+        )?
+        .unwrap();
+        let points: Vec<_> = (0..2000)
+            .map(|i| {
+                [
+                    ((i * 37 % 501) as f64 - 250.0) / 200.0,
+                    ((i * 73 % 401) as f64 - 200.0) / 200.0,
+                ]
+            })
+            .collect();
+        let groups: Vec<_> = (0..points.len()).map(|i| i % 2).collect();
+        for fast in [false, true] {
+            let mut gpu = gpu_density::GpuDensity::new(&opts, points.len())?;
+            let mut cpu = Density::new(opts.width * opts.height);
+            let mut rgb = vec![0; opts.width * opts.height * 3];
+            let mut gpu_rgb = vec![0; opts.width * opts.height * 3];
+            let mut exposure = 1.0;
+            for (frame, points) in [points.as_slice(), &[], points.as_slice()]
+                .into_iter()
+                .enumerate()
+            {
+                cpu.render(points, &groups, [0.0; 2], 1.0, &opts);
+                if frame == 0 {
+                    exposure = cpu.exposure();
+                }
+                cpu.rgb(&mut rgb, opts.width, opts.height, exposure, fast);
+                gpu.render(points, &groups, [0.0; 2], 1.0, &mut gpu_rgb, fast)?;
+                let worst = rgb
+                    .chunks_exact(3)
+                    .zip(gpu_rgb.chunks_exact(3))
+                    .flat_map(|(cpu, gpu)| (0..3).map(move |i| cpu[i].abs_diff(gpu[i])))
+                    .max()
+                    .unwrap();
+                assert!(
+                    worst <= 1,
+                    "GPU pixel error {worst}; fast={fast}, frame={frame}"
+                );
+            }
         }
         Ok(())
     }
@@ -1079,6 +1333,8 @@ mod tests {
             ["--cq", "18"],
             ["--preset", "p4"],
             ["--render-threads", "-1"],
+            ["--renderer", "other"],
+            ["--brightness", "other"],
         ] {
             assert!(Options::parse(args.map(str::to_owned)).is_err(), "{args:?}");
         }
@@ -1342,7 +1598,7 @@ mod tests {
                 exposure = density.exposure();
             }
             let mut pixels = vec![0; 64 * 64 * 3];
-            density.rgb(&mut pixels, 64, 64, exposure);
+            density.rgb(&mut pixels, 64, 64, exposure, opts.fast_brightness);
             expected.extend(pixels);
         }
         let fixture = TestFile::new(&bytes)?;

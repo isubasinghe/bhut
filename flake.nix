@@ -18,8 +18,12 @@
             pkgs.ffmpeg
             pkgs.rustc
             pkgs.cargo
+            pkgs.vulkan-loader
             (pkgs.python3.withPackages (ps: [ ps.numpy ps.matplotlib ]))
           ];
+          shellHook = ''
+            export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.vulkan-loader ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          '';
         };
       });
     };

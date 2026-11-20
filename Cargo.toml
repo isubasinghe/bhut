@@ -2,10 +2,13 @@
 name = "bhut-video"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 publish = false
 
 [dependencies]
 rayon = "1.10"
+wgpu = { version = "0.19", default-features = false, features = ["wgsl"] }
+pollster = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
