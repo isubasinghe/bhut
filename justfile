@@ -25,6 +25,10 @@ simulate: build
 
 # Make simulation.mp4 from simulation.bin
 video:
+    cargo run --release -- simulation.bin -o simulation.mp4 --fps {{fps}}
+
+# Use the original Python/Matplotlib renderer
+video-python:
     python3 make_video.py simulation.bin -o simulation.mp4 --fps {{fps}}
 
 # Make a looping simulation.gif from simulation.mp4 (run `just video` first)

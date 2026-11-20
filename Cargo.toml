@@ -1,0 +1,15 @@
+[package]
+name = "bhut-video"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+
+[[bin]]
+name = "make_video"
+path = "make_video.rs"
+
+[profile.release]
+lto = "thin"

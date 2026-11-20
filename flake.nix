@@ -16,6 +16,8 @@
             pkgs.openmpi # mpicxx, mpirun
             pkgs.just
             pkgs.ffmpeg
+            pkgs.rustc
+            pkgs.cargo
             (pkgs.python3.withPackages (ps: [ ps.numpy ps.matplotlib ]))
           ];
         };
