@@ -36,6 +36,29 @@ does not inherently encode faster. For example:
 cargo run --release -- simulation.bin -o simulation-h265.mp4 --fps 30 --preset veryfast
 ```
 
+For NVIDIA GPU encoding, run `just video-gpu` (writes `simulation.mp4`), or:
+
+```sh
+cargo run --release -- simulation.bin -o simulation-gpu.mp4 --fps 30 --encoder nvenc
+```
+
+`--encoder nvenc` selects `hevc_nvenc` for H.265, or `h264_nvenc` with
+`--codec h264`. Software encoding remains the default. The GPU path defaults
+to preset `p4` and CQ 18 with variable bitrate and no average bitrate target.
+Use `--preset p1` for maximum encoding speed, through `--preset p7` for greater
+compression effort, and `--cq 18` to set target quality (1–51; lower is better).
+CQ and software CRF are different controls and their numeric values are not
+directly comparable. Software preset names such as `veryfast` and `--crf` are
+rejected with NVENC; `--cq` requires NVENC.
+
+GPU encoding requires an NVENC-capable NVIDIA GPU, a compatible installed driver,
+and an FFmpeg build with the selected NVENC encoder. A one-frame hardware check
+at the requested resolution runs before camera scans and before opening the
+output. Failure reports the driver/encoder error without silently falling back.
+The density rendering, text overlays, and camera calculation still run on the
+CPU; only video compression moves to the GPU. See
+[NVIDIA's FFmpeg guide](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.0/ffmpeg-with-nvidia-gpu/index.html).
+
 Output defaults to 3840 × 2160 (4K UHD). Use `--width` and `--height` to change
 the resolution, for example `--width 2560 --height 2560` for a square video.
 Both dimensions must be positive even numbers.
@@ -44,6 +67,12 @@ The video renders a density grid matching the output resolution (3840 × 2160 by
 default), with a small Gaussian blur (sigma 1.4 output pixels) and logarithmic
 brightness. Each grid cell maps to one output pixel, without interpolated
 enlargement. Higher resolutions require more rendering time and memory.
+Blur and colour conversion run on a reusable worker pool, preserving the pixel
+calculations and accumulation order. The default uses up to eight available CPU
+threads. Override with `--render-threads 4`, use `--render-threads 1` for one
+worker, or `--render-threads 0` for automatic selection. This setting applies to
+density rendering; particle rendering is unchanged. The pool shares the density
+grids rather than allocating another full image per worker.
 Blue and orange track two spatial groups inferred from the initial frame; these
 approximate galaxy memberships because the simulation output has no galaxy labels.
 The camera and exposure stay fixed throughout the video. Exposure is set from
@@ -58,9 +87,25 @@ frames. Density mode expands the view along the longer output dimension to
 preserve proportions. Use `--fraction 0.99` to include more outskirts, or adjust the camera
 with `--elev 25 --azim 45` (angles in degrees).
 
-Rust retains exact camera quantiles across the complete simulation: three initial
-input scans use one 8-byte value per particle per complete frame. This startup
-stage must finish before rendering, and its memory still scales with the input.
+Rust retains exact camera quantiles across the complete simulation. On the first
+run, three input scans use one 8-byte value per particle per complete frame.
+The resulting bounds are saved beside the canonical input file, e.g.
+`simulation.bin.camera-cache`. Subsequent runs with a valid cache skip all three
+scans and their large temporary allocation.
+
+The cache is invalidated by changes to the input's size, timestamps, particle or
+frame count, camera elevation/azimuth, or `--fraction`. On Unix it also checks
+device/inode identity and change time, detecting replacements and same-size edits
+even if the modification time is restored. Resolution, codec, output path, and
+worker count can change without recalculating bounds. This uses filesystem
+metadata rather than rereading the entire input to hash its contents.
+
+Cache records are versioned and checksummed, and writes use an atomic rename.
+Missing, corrupt, or stale records are recomputed; a cache write failure does not
+stop rendering. Bounds are not cached if the input changes during camera setup.
+Use `--no-camera-cache` to bypass both reading and writing the sidecar. Cache files
+are ignored by Git. A cache miss still requires the scans and their input-sized
+temporary allocation before rendering can begin.
 
 After camera setup, a bounded pipeline overlaps reading/projecting upcoming frames,
 rendering, and writing completed RGB frames to FFmpeg. Linux uses the `io-uring`

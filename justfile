@@ -27,6 +27,10 @@ simulate: build
 video:
     cargo run --release -- simulation.bin -o simulation.mp4 --fps {{fps}}
 
+# Encode H.265 with the NVIDIA GPU
+video-gpu:
+    cargo run --release -- simulation.bin -o simulation.mp4 --fps {{fps}} --encoder nvenc
+
 # Use the original Python/Matplotlib renderer
 video-python:
     python3 make_video.py simulation.bin -o simulation.mp4 --fps {{fps}}

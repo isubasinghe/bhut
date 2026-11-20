@@ -1,7 +1,10 @@
 //! Render the simulator's native-endian binary output, streaming RGB to FFmpeg.
 //! The original Matplotlib renderer is make_video.py.
+mod camera_cache;
 mod frame_io;
+use camera_cache::CameraCache;
 use frame_io::{Backend, FrameReader};
+use rayon::prelude::*;
 use std::env;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -14,7 +17,7 @@ use std::time::Instant;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const COLOURS: [[f32; 3]; 2] = [[0.25, 0.70, 1.0], [1.0, 0.55, 0.20]];
 const HELP: &str =
-    "Make a video from simulation.bin (requires FFmpeg with drawtext and libx265/libx264).
+    "Make a video from simulation.bin (requires FFmpeg with drawtext and the selected encoder).
 Usage: make_video [simulation.bin] [options]
   -o, --output PATH         Output video (default: simulation.mp4; overwritten)
   --fps INTEGER             Frames per second (default: 10)
@@ -26,9 +29,13 @@ Usage: make_video [simulation.bin] [options]
   --elev NUMBER             Camera elevation in degrees (default: 25)
   --azim NUMBER             Camera azimuth in degrees (default: 45)
   --codec NAME              h265 or h264 (default: h265)
-  --preset NAME             x265/x264 speed preset (default: fast)
-  --crf NUMBER              Quality, 0–51; lower is better (default: 18)
+  --encoder NAME            software or nvenc (NVIDIA GPU; default: software)
+  --preset NAME             Software: fast; NVENC: p4 (p1 fastest, p7 slowest)
+  --crf NUMBER              Software quality, 0–51 (default: 18)
+  --cq NUMBER               NVENC target quality, 1–51 (default: 18)
   --io-backend NAME         auto, uring (Linux), or threaded (default: auto)
+  --render-threads INTEGER  Density workers (0 = automatic, default: 0)
+  --no-camera-cache         Recompute bounds without reading/writing the sidecar
   -h, --help                Show this help";
 
 struct Options {
@@ -46,6 +53,10 @@ struct Options {
     preset: String,
     crf: u8,
     backend: Backend,
+    nvenc: bool,
+    cq: u8,
+    render_threads: usize,
+    camera_cache: bool,
 }
 
 impl Options {
@@ -65,12 +76,21 @@ impl Options {
             preset: "fast".into(),
             crf: 18,
             backend: Backend::Auto,
+            nvenc: false,
+            cq: 18,
+            render_threads: 0,
+            camera_cache: true,
         };
         let mut args = args.into_iter();
         let mut positional = false;
+        let (mut preset_given, mut crf_given, mut cq_given) = (false, false, false);
         while let Some(arg) = args.next() {
             if arg == "--help" || arg == "-h" {
                 return Ok(None);
+            }
+            if arg == "--no-camera-cache" {
+                options.camera_cache = false;
+                continue;
             }
             if !arg.starts_with('-') {
                 if positional {
@@ -98,6 +118,9 @@ impl Options {
                     | "--preset"
                     | "--crf"
                     | "--io-backend"
+                    | "--encoder"
+                    | "--cq"
+                    | "--render-threads"
             ) {
                 return Err(format!("unknown option: {key}").into());
             }
@@ -110,6 +133,7 @@ impl Options {
                 "--fps" => options.fps = value.parse()?,
                 "--width" => options.width = value.parse()?,
                 "--height" => options.height = value.parse()?,
+                "--render-threads" => options.render_threads = value.parse()?,
                 "--render-mode" => {
                     options.particles = match value.as_str() {
                         "particles" => true,
@@ -128,8 +152,25 @@ impl Options {
                         _ => return Err("codec must be h265 or h264".into()),
                     }
                 }
-                "--preset" => options.preset = value,
-                "--crf" => options.crf = value.parse()?,
+                "--preset" => {
+                    options.preset = value;
+                    preset_given = true;
+                }
+                "--crf" => {
+                    options.crf = value.parse()?;
+                    crf_given = true;
+                }
+                "--cq" => {
+                    options.cq = value.parse()?;
+                    cq_given = true;
+                }
+                "--encoder" => {
+                    options.nvenc = match value.as_str() {
+                        "software" => false,
+                        "nvenc" => true,
+                        _ => return Err("encoder must be software or nvenc".into()),
+                    }
+                }
                 "--io-backend" => {
                     options.backend = match value.as_str() {
                         "auto" => Backend::Auto,
@@ -165,7 +206,25 @@ impl Options {
         if options.crf > 51 {
             return Err("CRF must be in 0–51".into());
         }
-        if !matches!(
+        if options.nvenc {
+            if !preset_given {
+                options.preset = "p4".into();
+            }
+            if crf_given {
+                return Err("NVENC uses --cq, not --crf".into());
+            }
+            if !(1..=51).contains(&options.cq) {
+                return Err("NVENC CQ must be in 1–51 (lower is better)".into());
+            }
+            if !matches!(
+                options.preset.as_str(),
+                "p1" | "p2" | "p3" | "p4" | "p5" | "p6" | "p7"
+            ) {
+                return Err("NVENC presets are p1 (fastest) through p7 (slowest)".into());
+            }
+        } else if cq_given {
+            return Err("--cq requires --encoder nvenc; use --crf for software encoding".into());
+        } else if !matches!(
             options.preset.as_str(),
             "ultrafast"
                 | "superfast"
@@ -182,6 +241,64 @@ impl Options {
         }
         Ok(Some(options))
     }
+
+    fn encoder_name(&self) -> &'static str {
+        match (self.nvenc, self.h265) {
+            (false, true) => "libx265",
+            (false, false) => "libx264",
+            (true, true) => "hevc_nvenc",
+            (true, false) => "h264_nvenc",
+        }
+    }
+
+    fn encoder_args(&self) -> Vec<String> {
+        let mut args: Vec<String> = ["-c:v", self.encoder_name(), "-preset", &self.preset]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        if self.nvenc {
+            args.extend([
+                "-rc".into(),
+                "vbr".into(),
+                "-cq".into(),
+                self.cq.to_string(),
+                "-b:v".into(),
+                "0".into(),
+            ]);
+        } else {
+            args.extend(["-crf".into(), self.crf.to_string()]);
+            if self.h265 {
+                args.extend(["-x265-params".into(), "log-level=error".into()]);
+            }
+        }
+        args
+    }
+}
+
+fn check_gpu_encoder(opts: &Options) -> Result<()> {
+    if !opts.nvenc {
+        return Ok(());
+    }
+    // Exercise the hardware at the requested size before scanning a large input or
+    // touching the output. Listing FFmpeg encoders alone does not test the driver.
+    eprintln!("Checking {} on the GPU...", opts.encoder_name());
+    let probe = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+        .arg(format!(
+            "color=size={}x{}:rate={}",
+            opts.width, opts.height, opts.fps
+        ))
+        .args(["-frames:v", "1", "-pix_fmt", "yuv420p"])
+        .args(opts.encoder_args())
+        .args(["-f", "null", "-"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("could not start FFmpeg for GPU check: {error}"))?;
+    if !probe.status.success() {
+        return Err(format!("{} GPU check failed. Check NVIDIA driver/device access and FFmpeg NVENC support, or use --encoder software.\n{}",
+            opts.encoder_name(), String::from_utf8_lossy(&probe.stderr).trim()).into());
+    }
+    Ok(())
 }
 
 struct Simulation {
@@ -191,11 +308,13 @@ struct Simulation {
     offset: u64,
     bytes: Vec<u8>,
     positions: Vec<[f64; 3]>,
+    signature: Option<String>,
 }
 
 impl Simulation {
     fn open(path: &str) -> Result<Self> {
         let mut file = File::open(path)?;
+        let signature = camera_cache::signature(&file).ok();
         let mut header = [0; 8];
         file.read_exact(&mut header)?;
         let n = i32::from_ne_bytes(header[..4].try_into()?);
@@ -219,6 +338,7 @@ impl Simulation {
             offset,
             bytes: vec![0; frame_bytes],
             positions: vec![[0.0; 3]; n],
+            signature,
         })
     }
 
@@ -419,6 +539,53 @@ fn fixed_view(
     Ok((centre, half))
 }
 
+fn cached_fixed_view(
+    sim: &mut Simulation,
+    projection: &Projection,
+    opts: &Options,
+) -> Result<camera_cache::Bounds> {
+    let cache = if opts.camera_cache {
+        sim.signature.as_ref().and_then(|stamp| {
+            match CameraCache::new(
+                Path::new(&opts.input),
+                stamp,
+                sim.n,
+                sim.frames,
+                [opts.elev, opts.azim, opts.fraction],
+            ) {
+                Ok(cache) => Some(cache),
+                Err(error) => {
+                    eprintln!("Camera cache disabled: {error}");
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
+    if let Some(cache) = &cache {
+        if cache.unchanged(&sim.file) {
+            if let Some(bounds) = cache.load() {
+                if cache.unchanged(&sim.file) {
+                    eprintln!("Using cached camera bounds: {}", cache.path.display());
+                    return Ok(bounds);
+                }
+            }
+        }
+    }
+    let bounds = fixed_view(sim, projection, opts.fraction)?;
+    if let Some(cache) = &cache {
+        if cache.unchanged(&sim.file) {
+            if let Err(error) = cache.store(bounds) {
+                eprintln!("Could not save camera cache (rendering continues): {error}");
+            }
+        } else {
+            eprintln!("Input changed during camera setup; bounds were not cached");
+        }
+    }
+    Ok(bounds)
+}
+
 fn blur(layer: &mut [f32], scratch: &mut [f32], width: usize, height: usize) {
     let mut kernel: [f32; 9] =
         std::array::from_fn(|i| (-0.5 * ((i as f32 - 4.0) / 1.4).powi(2)).exp());
@@ -426,35 +593,43 @@ fn blur(layer: &mut [f32], scratch: &mut [f32], width: usize, height: usize) {
     kernel.iter_mut().for_each(|v| *v /= sum);
     // Finish each row while it is in cache instead of scanning the whole 4K
     // image nine times. Keep the accumulation order and zero padding unchanged.
-    for (y, out) in scratch.chunks_exact_mut(width).enumerate() {
-        out.fill(0.0);
-        for (k, &weight) in kernel.iter().enumerate() {
-            let source = y as isize + k as isize - 4;
-            if source < 0 || source >= height as isize {
-                continue;
+    scratch
+        .par_chunks_exact_mut(width)
+        .enumerate()
+        .with_min_len(16)
+        .for_each(|(y, out)| {
+            out.fill(0.0);
+            for (k, &weight) in kernel.iter().enumerate() {
+                let source = y as isize + k as isize - 4;
+                if source < 0 || source >= height as isize {
+                    continue;
+                }
+                let row = &layer[source as usize * width..(source as usize + 1) * width];
+                for (out, &value) in out.iter_mut().zip(row) {
+                    *out += weight * value;
+                }
             }
-            let row = &layer[source as usize * width..(source as usize + 1) * width];
-            for (out, &value) in out.iter_mut().zip(row) {
-                *out += weight * value;
+        });
+    layer
+        .par_chunks_exact_mut(width)
+        .enumerate()
+        .with_min_len(16)
+        .for_each(|(y, out)| {
+            out.fill(0.0);
+            for (k, &weight) in kernel.iter().enumerate() {
+                let shift = k as isize - 4;
+                let start = (-shift).max(0) as usize;
+                let end = (width as isize - shift).min(width as isize).max(0) as usize;
+                if start >= end {
+                    continue;
+                }
+                let source = (y * width + start) as isize + shift;
+                let input = &scratch[source as usize..source as usize + end - start];
+                for (out, &value) in out[start..end].iter_mut().zip(input) {
+                    *out += weight * value;
+                }
             }
-        }
-    }
-    for (y, out) in layer.chunks_exact_mut(width).enumerate() {
-        out.fill(0.0);
-        for (k, &weight) in kernel.iter().enumerate() {
-            let shift = k as isize - 4;
-            let start = (-shift).max(0) as usize;
-            let end = (width as isize - shift).min(width as isize).max(0) as usize;
-            if start >= end {
-                continue;
-            }
-            let source = (y * width + start) as isize + shift;
-            let input = &scratch[source as usize..source as usize + end - start];
-            for (out, &value) in out[start..end].iter_mut().zip(input) {
-                *out += weight * value;
-            }
-        }
-    }
+        });
 }
 
 struct Density {
@@ -501,23 +676,28 @@ impl Density {
     }
     fn rgb(&self, pixels: &mut [u8], width: usize, height: usize, exposure: f32) {
         let denominator = (10.0 * exposure).ln_1p();
-        for y in 0..height {
-            let row = &mut pixels[(height - 1 - y) * width * 3..(height - y) * width * 3];
-            for (x, pixel) in row.chunks_exact_mut(3).enumerate() {
-                let a = self.layers[0][y * width + x];
-                let b = self.layers[1][y * width + x];
-                let total = a + b;
-                if total == 0.0 {
-                    pixel.fill(0);
-                    continue;
+        pixels
+            .par_chunks_exact_mut(width * 3)
+            .enumerate()
+            .with_min_len(16)
+            .for_each(|(screen_y, row)| {
+                let y = height - 1 - screen_y;
+                for (x, pixel) in row.chunks_exact_mut(3).enumerate() {
+                    let a = self.layers[0][y * width + x];
+                    let b = self.layers[1][y * width + x];
+                    let total = a + b;
+                    if total == 0.0 {
+                        pixel.fill(0);
+                        continue;
+                    }
+                    let brightness = ((10.0 * total).ln_1p() / denominator).min(1.0).powf(0.6);
+                    for c in 0..3 {
+                        pixel[c] = (255.0 * (a * COLOURS[0][c] + b * COLOURS[1][c])
+                            / total.max(1e-12)
+                            * brightness) as u8;
+                    }
                 }
-                let brightness = ((10.0 * total).ln_1p() / denominator).min(1.0).powf(0.6);
-                for c in 0..3 {
-                    pixel[c] = (255.0 * (a * COLOURS[0][c] + b * COLOURS[1][c]) / total.max(1e-12)
-                        * brightness) as u8;
-                }
-            }
-        }
+            });
     }
 }
 
@@ -618,6 +798,21 @@ fn render_pipeline(
 ) -> Result<()> {
     // Two reusable buffers at each boundary bound memory and apply backpressure.
     // Reading/projecting and writing to FFmpeg happen independently of rendering.
+    let pool = if opts.particles {
+        None
+    } else {
+        let workers = if opts.render_threads == 0 {
+            thread::available_parallelism().map_or(1, |n| n.get().min(8))
+        } else {
+            opts.render_threads
+        };
+        eprintln!("Density rendering: {workers} workers");
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()?,
+        )
+    };
     let (input_tx, input_rx) = sync_channel(1);
     let (input_free_tx, input_free_rx) = sync_channel(2);
     let (output_tx, output_rx) = sync_channel(1);
@@ -642,11 +837,13 @@ fn render_pipeline(
                     .recv()
                     .map_err(|_| "encoder writer stopped")?;
                 if let Some(density) = &mut density {
-                    density.render(&points, groups, centre, half, opts);
-                    if frame == 0 {
-                        exposure = density.exposure();
-                    }
-                    density.rgb(&mut pixels, opts.width, opts.height, exposure);
+                    pool.as_ref().unwrap().install(|| {
+                        density.render(&points, groups, centre, half, opts);
+                        if frame == 0 {
+                            exposure = density.exposure();
+                        }
+                        density.rgb(&mut pixels, opts.width, opts.height, exposure);
+                    });
                 } else {
                     particles(&mut pixels, &points, groups, centre, half, opts);
                 }
@@ -690,9 +887,9 @@ fn encode(
     let filter = format!("setsar=1,drawtext=text='Galaxy collision  |  step %{{n}}':fontcolor=white:fontsize=27:x=w*0.04:y=h*0.035,drawtext=text='Initial group 1':fontcolor=0x40b3ff:fontsize=21:x=w*0.04:y=h*0.075,drawtext=text='Initial group 2':fontcolor=0xff8c33:fontsize=21:x=w*0.24:y=h*0.075,drawtext=text='{caption}':fontcolor=0xa6a6a6:fontsize=19:x=w*0.04:y=h*0.975-th");
     let input = FrameReader::new(sim.file.try_clone()?, sim.offset, sim.n * 24, opts.backend)?;
     eprintln!(
-        "Input: {}; codec: {}; preset: {}",
+        "Input: {}; encoder: {}; preset: {}",
         input.name(),
-        if opts.h265 { "H.265" } else { "H.264" },
+        opts.encoder_name(),
         opts.preset
     );
     let mut command = Command::new("ffmpeg");
@@ -714,21 +911,16 @@ fn encode(
             "-i",
             "pipe:0",
             "-an",
-            "-c:v",
-            if opts.h265 { "libx265" } else { "libx264" },
-            "-preset",
-            &opts.preset,
-            "-crf",
-            &opts.crf.to_string(),
             "-pix_fmt",
             "yuv420p",
             "-vf",
             &filter,
             "-movflags",
             "+faststart",
-        ]);
+        ])
+        .args(opts.encoder_args());
     if opts.h265 {
-        command.args(["-tag:v", "hvc1", "-x265-params", "log-level=error"]);
+        command.args(["-tag:v", "hvc1"]);
     }
     let mut child = command
         .arg(&opts.output)
@@ -765,10 +957,11 @@ fn run() -> Result<()> {
         return Err("input and output must be different files".into());
     }
     let mut sim = Simulation::open(&opts.input)?;
+    check_gpu_encoder(&opts)?;
     sim.rewind()?;
     let groups = initial_groups(sim.read_frame()?);
     let projection = Projection::new(opts.elev, opts.azim);
-    let (centre, half) = fixed_view(&mut sim, &projection, opts.fraction)?;
+    let (centre, half) = cached_fixed_view(&mut sim, &projection, &opts)?;
     eprintln!(
         "{} planets, {} frames, centre {:?}, half width {:.4}",
         sim.n, sim.frames, centre, half
@@ -837,6 +1030,38 @@ mod tests {
     }
 
     #[test]
+    fn parallel_density_preserves_every_pixel() -> Result<()> {
+        let opts =
+            Options::parse(["--width", "258", "--height", "130"].map(str::to_owned))?.unwrap();
+        let points: Vec<_> = (0..2000)
+            .map(|i| {
+                [
+                    ((i * 37 % 501) as f64 - 250.0) / 200.0,
+                    ((i * 73 % 401) as f64 - 200.0) / 200.0,
+                ]
+            })
+            .collect();
+        let groups: Vec<_> = (0..points.len()).map(|i| i % 2).collect();
+        let render = |workers| -> Result<_> {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()?;
+            Ok(pool.install(|| {
+                let mut density = Density::new(opts.width * opts.height);
+                density.render(&points, &groups, [0.0; 2], 1.0, &opts);
+                let mut pixels = vec![0; opts.width * opts.height * 3];
+                density.rgb(&mut pixels, opts.width, opts.height, density.exposure());
+                (density.layers, pixels)
+            }))
+        };
+        let serial = render(1)?;
+        for workers in [2, 4, 8] {
+            assert_eq!(render(workers)?, serial);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn invalid_options_are_rejected() {
         for args in [
             ["--width", "3"],
@@ -850,9 +1075,88 @@ mod tests {
             ["--io-backend", "other"],
             ["--crf", "52"],
             ["--preset", "other"],
+            ["--encoder", "other"],
+            ["--cq", "18"],
+            ["--preset", "p4"],
+            ["--render-threads", "-1"],
         ] {
             assert!(Options::parse(args.map(str::to_owned)).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn encoder_options_keep_software_and_nvenc_settings_separate() -> Result<()> {
+        let software = Options::parse(Vec::<String>::new())?.unwrap();
+        assert_eq!(software.render_threads, 0);
+        assert!(software.camera_cache);
+        assert!(
+            !Options::parse(["--no-camera-cache".to_owned()])?
+                .unwrap()
+                .camera_cache
+        );
+        assert_eq!(software.encoder_name(), "libx265");
+        assert_eq!(software.preset, "fast");
+        assert!(software.encoder_args().contains(&"-crf".into()));
+        assert!(!software.encoder_args().contains(&"-cq".into()));
+        let gpu = Options::parse(["--encoder", "nvenc"].map(str::to_owned))?.unwrap();
+        assert_eq!(gpu.encoder_name(), "hevc_nvenc");
+        assert_eq!(gpu.preset, "p4");
+        assert_eq!(
+            gpu.encoder_args(),
+            [
+                "-c:v",
+                "hevc_nvenc",
+                "-preset",
+                "p4",
+                "-rc",
+                "vbr",
+                "-cq",
+                "18",
+                "-b:v",
+                "0"
+            ]
+        );
+        for codec in ["h264", "h265"] {
+            let gpu = Options::parse(
+                [
+                    "--preset",
+                    "p7",
+                    "--cq",
+                    "23",
+                    "--codec",
+                    codec,
+                    "--encoder",
+                    "nvenc",
+                ]
+                .map(str::to_owned),
+            )?
+            .unwrap();
+            assert_eq!(
+                gpu.encoder_name(),
+                if codec == "h264" {
+                    "h264_nvenc"
+                } else {
+                    "hevc_nvenc"
+                }
+            );
+            assert_eq!(gpu.preset, "p7");
+            assert_eq!(gpu.cq, 23);
+            assert!(!gpu
+                .encoder_args()
+                .iter()
+                .any(|arg| arg == "-crf" || arg == "-x265-params"));
+        }
+        for (option, value) in [
+            ("--crf", "18"),
+            ("--preset", "veryfast"),
+            ("--cq", "0"),
+            ("--cq", "52"),
+        ] {
+            assert!(
+                Options::parse(["--encoder", "nvenc", option, value].map(str::to_owned)).is_err()
+            );
+        }
+        Ok(())
     }
 
     struct TestFile(std::path::PathBuf);
@@ -879,7 +1183,110 @@ mod tests {
     impl Drop for TestFile {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
+            let mut sidecar = self.0.as_os_str().to_os_string();
+            sidecar.push(".camera-cache");
+            let _ = std::fs::remove_file(sidecar);
         }
+    }
+
+    fn camera_fixture() -> Result<(TestFile, Options)> {
+        let mut bytes = Vec::new();
+        bytes.extend(2i32.to_ne_bytes());
+        bytes.extend(2i32.to_ne_bytes());
+        for value in [
+            1.0_f64, 1.0, 0.0, -2.0, -4.0, 0.0, 2.0, 4.0, 0.0, -3.0, -6.0, 0.0, 3.0, 6.0,
+        ] {
+            bytes.extend(value.to_ne_bytes());
+        }
+        let file = TestFile::new(&bytes)?;
+        let opts = Options::parse([file.0.to_str().unwrap().to_owned()])?.unwrap();
+        Ok((file, opts))
+    }
+
+    #[test]
+    fn camera_cache_roundtrip_and_invalidation() -> Result<()> {
+        let (fixture, opts) = camera_fixture()?;
+        let mut sim = Simulation::open(&opts.input)?;
+        let projection = Projection::new(opts.elev, opts.azim);
+        let expected = fixed_view(&mut sim, &projection, opts.fraction)?;
+        assert_eq!(cached_fixed_view(&mut sim, &projection, &opts)?, expected);
+        let stamp = sim.signature.as_ref().unwrap().clone();
+        let key = |angles, n, frames| CameraCache::new(&fixture.0, &stamp, n, frames, angles);
+        let angles = [opts.elev, opts.azim, opts.fraction];
+        let cache = key(angles, sim.n, sim.frames)?;
+        assert_eq!(cache.load(), Some(expected));
+        // A hit performs no reads from the simulation after opening the file.
+        sim.file.seek(SeekFrom::End(0))?;
+        let before = sim.file.stream_position()?;
+        assert_eq!(cached_fixed_view(&mut sim, &projection, &opts)?, expected);
+        assert_eq!(sim.file.stream_position()?, before);
+        for i in 0..3 {
+            let mut changed = angles;
+            changed[i] += 0.01;
+            assert!(key(changed, sim.n, sim.frames)?.load().is_none());
+        }
+        assert!(key(angles, sim.n + 1, sim.frames)?.load().is_none());
+        assert!(key(angles, sim.n, sim.frames + 1)?.load().is_none());
+        // Corruption that still represents a finite float must also be detected.
+        let mut bytes = std::fs::read(&cache.path)?;
+        let end = bytes.len();
+        bytes[end - 32] ^= 1;
+        std::fs::write(&cache.path, bytes)?;
+        assert!(cache.load().is_none());
+        assert_eq!(cached_fixed_view(&mut sim, &projection, &opts)?, expected);
+        std::fs::write(&cache.path, b"truncated cache")?;
+        assert!(cache.load().is_none());
+        // Same-size changes invalidate the input signature.
+        thread::sleep(std::time::Duration::from_millis(10));
+        let mut edit = std::fs::OpenOptions::new().write(true).open(&fixture.0)?;
+        #[cfg(unix)]
+        let previous_modified = edit.metadata()?.modified()?;
+        edit.seek(SeekFrom::Start(24))?;
+        edit.write_all(&1.0_f64.to_ne_bytes())?;
+        assert!(!cache.unchanged(&sim.file));
+        #[cfg(unix)]
+        {
+            edit.set_times(std::fs::FileTimes::new().set_modified(previous_modified))?;
+            assert!(!cache.unchanged(&sim.file));
+        }
+        // Replacement and growth are independently represented in the key.
+        let replacement = TestFile::new(&std::fs::read(&fixture.0)?)?;
+        assert_ne!(
+            camera_cache::signature(&File::open(&replacement.0)?)?,
+            stamp
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn camera_cache_is_optional_and_never_publishes_changed_input() -> Result<()> {
+        let (fixture, mut opts) = camera_fixture()?;
+        let projection = Projection::new(opts.elev, opts.azim);
+        let mut sim = Simulation::open(&opts.input)?;
+        let cache = CameraCache::new(
+            &fixture.0,
+            sim.signature.as_ref().unwrap(),
+            sim.n,
+            sim.frames,
+            [opts.elev, opts.azim, opts.fraction],
+        )?;
+        opts.camera_cache = false;
+        let expected = cached_fixed_view(&mut sim, &projection, &opts)?;
+        assert!(!cache.path.exists());
+        opts.camera_cache = true;
+        // A non-writable cache location cannot prevent rendering.
+        std::fs::create_dir(&cache.path)?;
+        let result = cached_fixed_view(&mut sim, &projection, &opts);
+        std::fs::remove_dir(&cache.path)?;
+        assert_eq!(result?, expected);
+        // Simulate a producer appending after the initial frame-count snapshot.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&fixture.0)?
+            .write_all(&[0; 48])?;
+        assert_eq!(cached_fixed_view(&mut sim, &projection, &opts)?, expected);
+        assert!(!cache.path.exists());
+        Ok(())
     }
 
     #[test]
