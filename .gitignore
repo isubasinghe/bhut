@@ -1,5 +1,8 @@
 .ccls-cache
 build
-simulation.bin
+*.bin
+.direnv/
 simulation.mp4
 target/
+*.camera-cache
+*.camera-cache.tmp-*

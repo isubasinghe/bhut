@@ -6,8 +6,10 @@ np := "12"
 # Frames for each second of video
 fps := "30"
 # Smaller defaults for a GIF embedded in the README
-gif_fps := "10"
-gif_width := "640"
+gif_fps := "8"
+gif_width := "480"
+gif_speed := "4"
+gif_colors := "64"
 simulation := "simulation.bin"
 
 bin := "build/bhut"
@@ -49,10 +51,10 @@ video-gpu:
 video-python:
     python3 make_video.py simulation.bin -o simulation.mp4 --fps {{fps}}
 
-# Make a looping simulation.gif from simulation.mp4 (run `just video` first)
+# Make a compact, sped-up looping simulation.gif (run `just video` first)
 gif:
     ffmpeg -hide_banner -loglevel warning -y -i simulation.mp4 \
-        -filter_complex "fps={{gif_fps}},scale={{gif_width}}:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=bayer:bayer_scale=5" \
+        -filter_complex "setpts=(PTS-STARTPTS)/{{gif_speed}},fps={{gif_fps}},scale={{gif_width}}:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors={{gif_colors}}[p];[b][p]paletteuse=dither=none" \
         -an -loop 0 simulation.gif
 
 # Delete the compiled program and the outputs
